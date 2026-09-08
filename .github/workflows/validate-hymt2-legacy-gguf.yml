@@ -1,0 +1,589 @@
+name: Validate Hy-MT2 legacy GGUF on Windows
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/validate-hymt2-legacy-gguf.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-legacy-gguf:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    env:
+      MODEL_URL: https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf
+      MODEL_FILE: Hy-MT2-1.8B-1.25Bit.gguf
+      MODEL_SHA256: cc497fe8f033b52b3b8b00a7669e9661435432f9d4cd43f7ed24400c01507a93
+
+    steps:
+      - name: Fetch and freeze llama.cpp PR 22836
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $repo = "https://github.com/ggml-org/llama.cpp.git"
+          $prRef = "refs/pull/22836/head"
+
+          git init llama.cpp
+          Push-Location llama.cpp
+          git remote add origin $repo
+          git fetch --depth 1 origin $prRef
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch $prRef"
+          }
+
+          $sha = (git rev-parse FETCH_HEAD).Trim()
+
+          if ($sha -notmatch "^[0-9a-f]{40}$") {
+            throw "Unexpected PR SHA: $sha"
+          }
+
+          git checkout --detach FETCH_HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check out frozen PR head"
+          }
+
+          Pop-Location
+
+          "PR_SHA=$sha" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Frozen PR head SHA: $sha"
+
+      - name: Verify current STQ1_0 type IDs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ggmlHeader = Get-Content "llama.cpp/ggml/include/ggml.h" -Raw
+          $llamaHeader = Get-Content "llama.cpp/include/llama.h" -Raw
+
+          if ($ggmlHeader -notmatch "GGML_TYPE_Q2_0\s*=\s*42") {
+            throw "Current PR no longer has GGML_TYPE_Q2_0 = 42"
+          }
+
+          if ($ggmlHeader -notmatch "GGML_TYPE_STQ1_0\s*=\s*43") {
+            throw "Current PR no longer has GGML_TYPE_STQ1_0 = 43"
+          }
+
+          if ($llamaHeader -notmatch "LLAMA_FTYPE_MOSTLY_Q2_0\s*=\s*41") {
+            throw "Current PR no longer has LLAMA_FTYPE_MOSTLY_Q2_0 = 41"
+          }
+
+          if ($llamaHeader -notmatch "LLAMA_FTYPE_MOSTLY_STQ1_0\s*=\s*42") {
+            throw "Current PR no longer has LLAMA_FTYPE_MOSTLY_STQ1_0 = 42"
+          }
+
+          Write-Host "Current type layout verified:"
+          Write-Host "  tensor Q2_0=42, STQ1_0=43"
+          Write-Host "  ftype  Q2_0=41, STQ1_0=42"
+
+      - name: Configure Windows x64 CPU-only MSVC build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S llama.cpp `
+            -B build `
+            -G "Visual Studio 18 2026" `
+            -A x64 `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_UI=OFF `
+            -DLLAMA_USE_PREBUILT_UI=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_CUDA=OFF `
+            -DGGML_VULKAN=OFF `
+            -DGGML_METAL=OFF `
+            -DGGML_OPENCL=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build llama-server Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            --build build `
+            --config Release `
+            --target llama-server `
+            --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Download exact official Hy-MT2 1.25-bit GGUF
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path model | Out-Null
+          $dest = Join-Path "model" $env:MODEL_FILE
+
+          curl.exe `
+            -L `
+            --fail `
+            --retry 3 `
+            --retry-delay 3 `
+            --output $dest `
+            $env:MODEL_URL
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Model download failed with exit code $LASTEXITCODE"
+          }
+
+          $actual = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "Downloaded bytes: $((Get-Item $dest).Length)"
+          Write-Host "SHA256: $actual"
+
+          if ($actual -ne $env:MODEL_SHA256) {
+            throw "Model SHA mismatch. Expected $env:MODEL_SHA256, got $actual"
+          }
+
+          Write-Host "Official model SHA256 PASS"
+
+      - name: Reproduce original load failure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $server = (Resolve-Path "build/bin/Release/llama-server.exe").Path
+          $model = (Resolve-Path ("model/" + $env:MODEL_FILE)).Path
+          $stdout = Join-Path $PWD "baseline-stdout.log"
+          $stderr = Join-Path $PWD "baseline-stderr.log"
+
+          $proc = Start-Process `
+            -FilePath $server `
+            -ArgumentList @(
+              "-m", $model,
+              "-ngl", "0",
+              "--ctx-size", "512",
+              "--host", "127.0.0.1",
+              "--port", "18081"
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+
+          $ready = $false
+
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($proc.HasExited) {
+              break
+            }
+
+            try {
+              $health = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:18081/health" `
+                -UseBasicParsing `
+                -TimeoutSec 2
+
+              if ($health.StatusCode -eq 200) {
+                $ready = $true
+                break
+              }
+            }
+            catch {
+              # Expected while the model is loading.
+            }
+          }
+
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force
+            $proc.WaitForExit()
+          }
+
+          $text = ""
+          if (Test-Path $stdout) {
+            $text += Get-Content $stdout -Raw
+          }
+          if (Test-Path $stderr) {
+            $text += "`n" + (Get-Content $stderr -Raw)
+          }
+
+          Write-Host "===== BASELINE OUTPUT ====="
+          Write-Host $text
+
+          if ($ready) {
+            Write-Host "WARNING: original GGUF unexpectedly loaded successfully."
+            "BASELINE_REPRO=false" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          elseif (
+            $text -match "offset 203154464" -or
+            $text -match "failed to read tensor data"
+          ) {
+            Write-Host "Baseline offset failure reproduced."
+            "BASELINE_REPRO=true" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          else {
+            throw "Original model failed, but not with the expected GGUF offset/read error."
+          }
+
+      - name: Create header-only legacy ID migration tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          @'
+          import collections
+          import hashlib
+          import shutil
+          import struct
+          import sys
+
+          UINT8 = 0
+          INT8 = 1
+          UINT16 = 2
+          INT16 = 3
+          UINT32 = 4
+          INT32 = 5
+          FLOAT32 = 6
+          BOOL = 7
+          STRING = 8
+          ARRAY = 9
+          UINT64 = 10
+          INT64 = 11
+          FLOAT64 = 12
+
+          FIXED = {
+              UINT8: 1,
+              INT8: 1,
+              UINT16: 2,
+              INT16: 2,
+              UINT32: 4,
+              INT32: 4,
+              FLOAT32: 4,
+              BOOL: 1,
+              UINT64: 8,
+              INT64: 8,
+              FLOAT64: 8,
+          }
+
+          src, dst = sys.argv[1], sys.argv[2]
+          shutil.copyfile(src, dst)
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for block in iter(lambda: fh.read(1024 * 1024), b""):
+                      h.update(block)
+              return h.hexdigest()
+
+          with open(dst, "r+b") as f:
+              def read_exact(n):
+                  b = f.read(n)
+                  if len(b) != n:
+                      raise EOFError(f"wanted {n} bytes at {f.tell() - len(b)}")
+                  return b
+
+              def u32():
+                  return struct.unpack("<I", read_exact(4))[0]
+
+              def u64():
+                  return struct.unpack("<Q", read_exact(8))[0]
+
+              def read_string():
+                  n = u64()
+                  return read_exact(n).decode("utf-8")
+
+              def skip_value(vtype):
+                  if vtype in FIXED:
+                      f.seek(FIXED[vtype], 1)
+                      return
+
+                  if vtype == STRING:
+                      n = u64()
+                      f.seek(n, 1)
+                      return
+
+                  if vtype == ARRAY:
+                      elem = u32()
+                      count = u64()
+
+                      if elem in FIXED:
+                          f.seek(FIXED[elem] * count, 1)
+                          return
+
+                      for _ in range(count):
+                          skip_value(elem)
+                      return
+
+                  raise RuntimeError(f"unsupported GGUF metadata value type {vtype}")
+
+              magic = read_exact(4)
+              if magic != b"GGUF":
+                  raise RuntimeError(f"bad GGUF magic: {magic!r}")
+
+              version = u32()
+              n_tensors = u64()
+              n_kv = u64()
+
+              print(f"GGUF version={version} tensors={n_tensors} kv={n_kv}")
+
+              file_type_old = None
+              file_type_new = None
+
+              for _ in range(n_kv):
+                  key = read_string()
+                  vtype = u32()
+
+                  if key == "general.file_type" and vtype in (UINT32, INT32):
+                      pos = f.tell()
+                      old = u32()
+                      file_type_old = old
+                      new = 42 if old == 41 else old
+
+                      if new != old:
+                          after = f.tell()
+                          f.seek(pos)
+                          f.write(struct.pack("<I", new))
+                          f.seek(after)
+
+                      file_type_new = new
+                      print(f"general.file_type: {old} -> {new}")
+                  else:
+                      skip_value(vtype)
+
+              type_hist = collections.Counter()
+              changed = []
+              samples = []
+
+              for _ in range(n_tensors):
+                  name = read_string()
+                  n_dims = u32()
+                  dims = [u64() for _ in range(n_dims)]
+
+                  type_pos = f.tell()
+                  qtype = u32()
+                  offset = u64()
+
+                  type_hist[qtype] += 1
+
+                  if qtype == 42:
+                      after = f.tell()
+                      f.seek(type_pos)
+                      f.write(struct.pack("<I", 43))
+                      f.seek(after)
+
+                      changed.append(name)
+                      if len(samples) < 20:
+                          samples.append((name, dims, offset))
+
+              if not changed:
+                  raise RuntimeError(
+                      "No tensor type 42 entries were found; refusing to modify the file."
+                  )
+
+          print("Tensor type histogram before migration:")
+          for k, v in sorted(type_hist.items()):
+              print(f"  type {k}: {v}")
+
+          print(f"Migrated tensor type 42 -> 43 for {len(changed)} tensors")
+          for name, dims, offset in samples:
+              print(f"  sample: {name} dims={dims} offset={offset}")
+
+          print(f"Source SHA256:  {sha256(src)}")
+          print(f"Patched SHA256: {sha256(dst)}")
+          print(f"general.file_type: {file_type_old} -> {file_type_new}")
+          '@ | Set-Content -Encoding utf8 patch_legacy_hymt2_ids.py
+
+      - name: Migrate legacy GGUF IDs without touching weights
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $src = "model/" + $env:MODEL_FILE
+          $dst = "model/Hy-MT2-1.8B-1.25Bit-ids-migrated.gguf"
+
+          python patch_legacy_hymt2_ids.py $src $dst |
+            Tee-Object -FilePath patch-report.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Legacy ID migration failed"
+          }
+
+          $patched = (Get-FileHash $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+          "PATCHED_SHA256=$patched" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Patched GGUF SHA256: $patched"
+
+      - name: Load migrated model and run shipped translation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $server = (Resolve-Path "build/bin/Release/llama-server.exe").Path
+          $model = (Resolve-Path "model/Hy-MT2-1.8B-1.25Bit-ids-migrated.gguf").Path
+          $stdout = Join-Path $PWD "patched-stdout.log"
+          $stderr = Join-Path $PWD "patched-stderr.log"
+
+          $proc = Start-Process `
+            -FilePath $server `
+            -ArgumentList @(
+              "-m", $model,
+              "-ngl", "0",
+              "--ctx-size", "1024",
+              "--host", "127.0.0.1",
+              "--port", "18082"
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+
+          $ready = $false
+
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($proc.HasExited) {
+              break
+            }
+
+            try {
+              $health = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:18082/health" `
+                -UseBasicParsing `
+                -TimeoutSec 2
+
+              if ($health.StatusCode -eq 200) {
+                $ready = $true
+                break
+              }
+            }
+            catch {
+              # Expected while the model is loading.
+            }
+          }
+
+          if (-not $ready) {
+            if (-not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+              $proc.WaitForExit()
+            }
+
+            Write-Host "===== PATCHED STDOUT ====="
+            if (Test-Path $stdout) { Get-Content $stdout }
+
+            Write-Host "===== PATCHED STDERR ====="
+            if (Test-Path $stderr) { Get-Content $stderr }
+
+            throw "Migrated model did not reach ready state."
+          }
+
+          $prompt = "Translate the following text into Chinese. Note that you should only output the translated result without any additional explanation:`nCould you confirm whether the samples were shipped today?"
+
+          $body = @{
+            prompt = $prompt
+            n_predict = 64
+            temperature = 0.7
+            top_p = 0.6
+            top_k = 20
+            repeat_penalty = 1.05
+            seed = 42
+            stream = $false
+          } | ConvertTo-Json
+
+          $result = Invoke-RestMethod `
+            -Method Post `
+            -Uri "http://127.0.0.1:18082/completion" `
+            -ContentType "application/json" `
+            -Body $body `
+            -TimeoutSec 240
+
+          $translation = [string]$result.content
+
+          Write-Host "===== TRANSLATION RESULT ====="
+          Write-Host $translation
+
+          if ([string]::IsNullOrWhiteSpace($translation)) {
+            throw "Model loaded but returned an empty translation."
+          }
+
+          $translation |
+            Set-Content -Encoding utf8 translation-result.txt
+
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force
+            $proc.WaitForExit()
+          }
+
+      - name: Create validation report
+        if: success()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          @"
+          Hy-MT2 legacy GGUF Windows validation
+          ======================================
+          Frozen PR head: $env:PR_SHA
+          Official source SHA256: $env:MODEL_SHA256
+          Patched GGUF SHA256: $env:PATCHED_SHA256
+          Baseline offset failure reproduced: $env:BASELINE_REPRO
+
+          Migration:
+          - general.file_type legacy 41 -> current STQ1_0 file type 42, when present
+          - tensor quant type legacy 42 -> current STQ1_0 tensor type 43
+          - tensor payload bytes are not modified
+
+          Translation:
+          $(Get-Content translation-result.txt -Raw)
+          "@ | Set-Content -Encoding utf8 validation-summary.txt
+
+          Get-Content validation-summary.txt
+
+      - name: Upload successful validation evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymt2-legacy-gguf-windows-validation
+          path: |
+            patch_legacy_hymt2_ids.py
+            patch-report.txt
+            validation-summary.txt
+            translation-result.txt
+            baseline-stdout.log
+            baseline-stderr.log
+            patched-stdout.log
+            patched-stderr.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hymt2-legacy-gguf-windows-failure-logs
+          path: |
+            patch_legacy_hymt2_ids.py
+            patch-report.txt
+            baseline-stdout.log
+            baseline-stderr.log
+            patched-stdout.log
+            patched-stderr.log
+          if-no-files-found: warn
+          retention-days: 7
