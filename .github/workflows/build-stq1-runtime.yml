@@ -1,0 +1,360 @@
+name: Build STQ1_0 Windows runtime
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Fetch and freeze llama.cpp PR 22836
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $repo = "https://github.com/ggml-org/llama.cpp.git"
+          $prRef = "refs/pull/22836/head"
+
+          git init llama.cpp
+          Push-Location llama.cpp
+
+          git remote add origin $repo
+
+          # Fetch the PR head exactly once.
+          git fetch --depth 1 origin $prRef
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch $prRef"
+          }
+
+          $sha = (git rev-parse FETCH_HEAD).Trim()
+
+          if ($sha -notmatch "^[0-9a-f]{40}$") {
+            throw "Unexpected PR SHA: $sha"
+          }
+
+          git checkout --detach FETCH_HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check out frozen PR head"
+          }
+
+          $actual = (git rev-parse HEAD).Trim()
+
+          if ($actual -ne $sha) {
+            throw "Checked out $actual but expected $sha"
+          }
+
+          Pop-Location
+
+          "PR_SHA=$sha" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
+
+          Write-Host "Frozen PR head SHA: $sha"
+
+      - name: Verify STQ1_0 source support
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $headerPath = "llama.cpp/ggml/include/ggml.h"
+
+          if (-not (Test-Path $headerPath)) {
+            throw "ggml.h was not found"
+          }
+
+          $header = Get-Content $headerPath -Raw
+
+          if ($header -notmatch "GGML_TYPE_STQ1_0") {
+            throw "GGML_TYPE_STQ1_0 is absent from frozen source $env:PR_SHA"
+          }
+
+          $refs = @(
+            Get-ChildItem `
+              "llama.cpp/ggml", `
+              "llama.cpp/src" `
+              -Recurse `
+              -File `
+              -Include *.c,*.cpp,*.h,*.hpp |
+            Select-String -SimpleMatch "STQ1_0"
+          )
+
+          if ($refs.Count -lt 5) {
+            throw "STQ1_0 implementation appears incomplete: $($refs.Count) references"
+          }
+
+          Write-Host "STQ1_0 verified"
+          Write-Host "Reference count: $($refs.Count)"
+          Write-Host "Frozen SHA: $env:PR_SHA"
+
+      - name: Configure Windows x64 CPU-only MSVC build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S llama.cpp `
+            -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_UI=OFF `
+            -DLLAMA_USE_PREBUILT_UI=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_CUDA=OFF `
+            -DGGML_VULKAN=OFF `
+            -DGGML_METAL=OFF `
+            -DGGML_OPENCL=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build llama-server Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            --build build `
+            --config Release `
+            --target llama-server `
+            --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Collect Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binDir = "build/bin/Release"
+
+          if (-not (Test-Path $binDir)) {
+            $binDir = "build/bin"
+          }
+
+          $server = Join-Path $binDir "llama-server.exe"
+
+          if (-not (Test-Path $server)) {
+            throw "llama-server.exe was not produced under $binDir"
+          }
+
+          $outRoot = "out"
+          $runtimeDir = Join-Path `
+            $outRoot `
+            "llama-pr22836-stq1-win-cpu-x64"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $runtimeDir |
+            Out-Null
+
+          Copy-Item `
+            $server `
+            $runtimeDir `
+            -Force
+
+          Get-ChildItem `
+            $binDir `
+            -Filter "*.dll" `
+            -File |
+            Copy-Item `
+              -Destination $runtimeDir `
+              -Force
+
+          Copy-Item `
+            "llama.cpp/LICENSE" `
+            (Join-Path $runtimeDir "LICENSE-llama.cpp.txt") `
+            -Force
+
+          Write-Host "Collected runtime files:"
+          Get-ChildItem $runtimeDir
+
+      - name: Verify PE x64 binaries and create manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $outRoot = "out"
+          $runtimeDir = Join-Path `
+            $outRoot `
+            "llama-pr22836-stq1-win-cpu-x64"
+
+          function Test-PeX64 {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path
+            )
+
+            $stream = [IO.File]::OpenRead($Path)
+
+            try {
+              $mz = New-Object byte[] 2
+              [void]$stream.Read($mz, 0, 2)
+
+              if (
+                [Text.Encoding]::ASCII.GetString($mz) -ne "MZ"
+              ) {
+                return $false
+              }
+
+              $stream.Position = 0x3C
+
+              $offsetBytes = New-Object byte[] 4
+              [void]$stream.Read($offsetBytes, 0, 4)
+
+              $peOffset = [BitConverter]::ToInt32(
+                $offsetBytes,
+                0
+              )
+
+              $stream.Position = $peOffset + 4
+
+              $machineBytes = New-Object byte[] 2
+              [void]$stream.Read(
+                $machineBytes,
+                0,
+                2
+              )
+
+              $machine = [BitConverter]::ToUInt16(
+                $machineBytes,
+                0
+              )
+
+              return ($machine -eq 0x8664)
+            }
+            finally {
+              $stream.Dispose()
+            }
+          }
+
+          $binaries = @(
+            Get-ChildItem `
+              $runtimeDir `
+              -File |
+            Where-Object {
+              $_.Extension -in ".exe", ".dll"
+            }
+          )
+
+          if ($binaries.Count -lt 1) {
+            throw "No runtime binaries were collected"
+          }
+
+          foreach ($file in $binaries) {
+            if (-not (Test-PeX64 $file.FullName)) {
+              throw "$($file.Name) is not a Windows PE x64 binary"
+            }
+
+            Write-Host "PE x64 PASS: $($file.Name)"
+          }
+
+          $manifestFiles = @(
+            $binaries |
+            Sort-Object Name |
+            ForEach-Object {
+              [ordered]@{
+                name = $_.Name
+                bytes = $_.Length
+                sha256 = (
+                  Get-FileHash `
+                    $_.FullName `
+                    -Algorithm SHA256
+                ).Hash.ToLowerInvariant()
+              }
+            }
+          )
+
+          $manifest = [ordered]@{
+            runtime = "llama-pr22836-stq1-win-cpu-x64"
+            source = "https://github.com/ggml-org/llama.cpp"
+            pullRequest = 22836
+            ref = "refs/pull/22836/head"
+            frozenHeadSha = $env:PR_SHA
+            quantSupport = "STQ1_0 (Hy-MT2 1.25-bit)"
+            architecture = "Windows x64"
+            runnerOS = $env:RUNNER_OS
+            runnerName = $env:RUNNER_NAME
+            toolchain = "GitHub Actions windows-latest / Visual Studio 2022 MSVC / CMake / CPU-only"
+            builtOnUtc = (
+              Get-Date
+            ).ToUniversalTime().ToString("o")
+            files = $manifestFiles
+          }
+
+          $manifestPath = Join-Path `
+            $outRoot `
+            "runtime-manifest.json"
+
+          $manifest |
+            ConvertTo-Json -Depth 6 |
+            Set-Content `
+              -Path $manifestPath `
+              -Encoding utf8
+
+          Copy-Item `
+            $manifestPath `
+            (Join-Path $runtimeDir "runtime-manifest.json") `
+            -Force
+
+          Write-Host "===== RUNTIME MANIFEST ====="
+          Get-Content $manifestPath
+
+      - name: Create runtime ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $runtimeDir = "out/llama-pr22836-stq1-win-cpu-x64"
+          $zipPath = "out/llama-pr22836-stq1-win-cpu-x64.zip"
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          Compress-Archive `
+            -Path $runtimeDir `
+            -DestinationPath $zipPath `
+            -Force
+
+          if (-not (Test-Path $zipPath)) {
+            throw "Runtime ZIP was not created"
+          }
+
+          $zip = Get-Item $zipPath
+
+          Write-Host "ZIP created:"
+          Write-Host $zip.FullName
+          Write-Host "ZIP bytes: $($zip.Length)"
+
+      - name: Upload STQ1_0 runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-pr22836-stq1-win-cpu-x64
+          path: |
+            out/llama-pr22836-stq1-win-cpu-x64.zip
+            out/runtime-manifest.json
+          if-no-files-found: error
+          retention-days: 7
