@@ -297,7 +297,7 @@ jobs:
             architecture = "Windows x64"
             runnerOS = $env:RUNNER_OS
             runnerName = $env:RUNNER_NAME
-            toolchain = "GitHub Actions windows-latest / Visual Studio 2022 MSVC / CMake / CPU-only"
+            toolchain = "GitHub Actions windows-latest / Visual Studio 2026 MSVC / CMake / CPU-only"
             builtOnUtc = (
               Get-Date
             ).ToUniversalTime().ToString("o")
