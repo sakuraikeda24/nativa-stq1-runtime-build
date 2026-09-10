@@ -1,0 +1,191 @@
+name: Build Nativa b10516 clean runtime probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    env:
+      EXPECTED_LLAMA_COMMIT: b95502ba9aa0eb73a2f4fc8878d7fbe6a847a0b9
+
+    steps:
+      - name: Fetch exact llama.cpp b10516
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin refs/tags/b10516
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch llama.cpp tag b10516"
+          }
+
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check out b10516"
+          }
+
+          $actual = (git -C llama.cpp rev-parse HEAD).Trim()
+
+          Write-Host "Expected commit: $env:EXPECTED_LLAMA_COMMIT"
+          Write-Host "Actual commit:   $actual"
+
+          if ($actual -ne $env:EXPECTED_LLAMA_COMMIT) {
+            throw "b10516 resolved to unexpected commit $actual"
+          }
+
+          Write-Host "Frozen upstream commit PASS"
+
+      - name: Configure clean Windows x64 runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S llama.cpp `
+            -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_BUILD_COMMON=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_APP=OFF `
+            -DLLAMA_BUILD_UI=OFF `
+            -DLLAMA_USE_PREBUILT_UI=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_BORINGSSL=OFF `
+            -DLLAMA_BUILD_LIBRESSL=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=OFF `
+            -DGGML_CUDA=OFF `
+            -DGGML_VULKAN=OFF `
+            -DGGML_SYCL=OFF `
+            -DGGML_BLAS=OFF `
+            -DGGML_METAL=OFF `
+            -DGGML_OPENCL=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
+      - name: Verify frozen CMake options
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cache = Get-Content "build/CMakeCache.txt"
+
+          $required = @(
+            "^BUILD_SHARED_LIBS:BOOL=ON$",
+            "^LLAMA_BUILD_TOOLS:BOOL=ON$",
+            "^LLAMA_BUILD_SERVER:BOOL=ON$",
+            "^LLAMA_BUILD_UI:BOOL=OFF$",
+            "^LLAMA_USE_PREBUILT_UI:BOOL=OFF$",
+            "^LLAMA_OPENSSL:BOOL=OFF$",
+            "^LLAMA_BUILD_BORINGSSL:.*=OFF$",
+            "^LLAMA_BUILD_LIBRESSL:.*=OFF$",
+            "^GGML_OPENMP:BOOL=OFF$",
+            "^GGML_NATIVE:BOOL=OFF$",
+            "^GGML_BACKEND_DL:BOOL=ON$",
+            "^GGML_CPU_ALL_VARIANTS:BOOL=ON$",
+            "^GGML_RPC:BOOL=OFF$",
+            "^GGML_CUDA:BOOL=OFF$",
+            "^GGML_VULKAN:BOOL=OFF$",
+            "^GGML_SYCL:BOOL=OFF$",
+            "^GGML_BLAS:BOOL=OFF$"
+          )
+
+          foreach ($pattern in $required) {
+            if (-not ($cache | Select-String -Pattern $pattern)) {
+              throw "Required CMake setting missing: $pattern"
+            }
+          }
+
+          Write-Host "Frozen CMake options PASS"
+
+      - name: Build llama-server Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            --build build `
+            --config Release `
+            --target llama-server `
+            --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "llama-server build failed"
+          }
+
+      - name: Inspect build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binDir = "build/bin/Release"
+
+          if (-not (Test-Path "$binDir/llama-server.exe")) {
+            throw "llama-server.exe was not produced"
+          }
+
+          Write-Host "===== BUILD OUTPUT ====="
+          Get-ChildItem $binDir -File |
+            Sort-Object Name |
+            Format-Table Name, Length
+
+          $runtimeFiles = @(
+            Get-ChildItem $binDir -File |
+            Where-Object {
+              $_.Extension -in ".exe", ".dll"
+            }
+          )
+
+          $forbidden = @(
+            "libomp",
+            "vcomp",
+            "libssl",
+            "libcrypto",
+            "boringssl",
+            "libressl",
+            "cudart",
+            "cublas",
+            "vulkan",
+            "sycl",
+            "opencl"
+          )
+
+          foreach ($file in $runtimeFiles) {
+            foreach ($word in $forbidden) {
+              if ($file.Name -match [regex]::Escape($word)) {
+                throw "Forbidden runtime file found: $($file.Name)"
+              }
+            }
+          }
+
+          Write-Host "Basic forbidden-file audit PASS"
+
+      - name: Upload clean runtime probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: nativa-b10516-clean-probe
+          path: |
+            build/bin/Release/llama-server.exe
+            build/bin/Release/*.dll
+          if-no-files-found: error
+          retention-days: 7
