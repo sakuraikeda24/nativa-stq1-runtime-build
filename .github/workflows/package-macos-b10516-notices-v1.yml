@@ -461,8 +461,60 @@ jobs:
           )
 
           echo "Exact UI dependency tree installed with lifecycle scripts disabled"
+      - name: Build exact production embedded UI with source maps
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Build embedded UI npm licence inventory
+          ui="llama.cpp/tools/ui"
+
+          (
+            cd "$ui"
+
+            rm -rf audit-ui-dist .svelte-kit
+
+            export LLAMA_UI_OUT_DIR="$PWD/audit-ui-dist"
+
+            npm run build-pwa-assets
+
+            ./node_modules/.bin/vite build --sourcemap
+
+            if [ ! -f "$LLAMA_UI_OUT_DIR/index.html" ]; then
+              echo "::error::Production UI audit build did not produce index.html"
+              exit 1
+            fi
+
+            map_count="$(
+              find "$LLAMA_UI_OUT_DIR" \
+                -type f \
+                -name '*.map' \
+                | wc -l \
+                | tr -d '[:space:]'
+            )"
+
+            if ! [[ "$map_count" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not determine production UI source-map count"
+              exit 1
+            fi
+
+            if [ "$map_count" -eq 0 ]; then
+              echo "::error::Production UI audit build produced zero source maps"
+              exit 1
+            fi
+
+            echo "Production UI audit output:"
+            echo "$LLAMA_UI_OUT_DIR"
+
+            echo "Production UI source maps:"
+            echo "$map_count"
+
+            echo "UI_AUDIT_OUT_DIR=$LLAMA_UI_OUT_DIR" >> "$GITHUB_ENV"
+            echo "UI_SOURCE_MAP_COUNT=$map_count" >> "$GITHUB_ENV"
+          )
+
+          echo "Exact production embedded UI source-map build PASS"
+
+           - name: Build production-bundle npm licence inventory
         shell: bash
         run: |
           set -euo pipefail
@@ -474,9 +526,14 @@ jobs:
           const fs = require("fs");
           const path = require("path");
           const crypto = require("crypto");
+          const { fileURLToPath } = require("url");
 
           const uiRoot = path.resolve("llama.cpp/tools/ui");
           const lockPath = path.join(uiRoot, "package-lock.json");
+
+          const outDir = process.env.UI_AUDIT_OUT_DIR
+            ? path.resolve(process.env.UI_AUDIT_OUT_DIR)
+            : path.join(uiRoot, "audit-ui-dist");
 
           const legalRoot = path.resolve(
             "dist",
@@ -492,6 +549,12 @@ jobs:
 
           fs.mkdirSync(npmLicenseRoot, { recursive: true });
 
+          if (!fs.existsSync(outDir)) {
+            throw new Error(
+              `Production UI audit output missing: ${outDir}`
+            );
+          }
+
           const lock = JSON.parse(
             fs.readFileSync(lockPath, "utf8")
           );
@@ -503,7 +566,10 @@ jobs:
           }
 
           const sha256 = (buf) =>
-            crypto.createHash("sha256").update(buf).digest("hex");
+            crypto
+              .createHash("sha256")
+              .update(buf)
+              .digest("hex");
 
           const safeName = (value) =>
             value
@@ -511,35 +577,668 @@ jobs:
               .replace(/[\/\\:@\s]+/g, "__")
               .replace(/[^A-Za-z0-9._+-]/g, "_");
 
+          const walkFiles = (root, predicate) => {
+            const result = [];
+
+            const visit = (dir) => {
+              for (const entry of fs.readdirSync(
+                dir,
+                { withFileTypes: true }
+              )) {
+                const abs = path.join(dir, entry.name);
+
+                if (entry.isDirectory()) {
+                  visit(abs);
+                } else if (
+                  entry.isFile() &&
+                  predicate(abs)
+                ) {
+                  result.push(abs);
+                }
+              }
+            };
+
+            visit(root);
+
+            return result.sort((a, b) =>
+              a.localeCompare(b)
+            );
+          };
+
+          const mapFiles = walkFiles(
+            outDir,
+            (file) => file.endsWith(".map")
+          );
+
+          if (mapFiles.length === 0) {
+            throw new Error(
+              "Production UI output contains zero source maps"
+            );
+          }
+
+          const lockEntries = Object.entries(lock.packages)
+            .filter(([key, entry]) =>
+              key &&
+              key.includes("node_modules/") &&
+              entry &&
+              typeof entry === "object"
+            )
+            .map(([key, entry]) => {
+              const normalizedKey =
+                key.replace(/\\/g, "/");
+
+              const parts =
+                normalizedKey.split("/");
+
+              let idx = -1;
+
+              for (let i = parts.length - 1; i >= 0; i--) {
+                if (parts[i] === "node_modules") {
+                  idx = i;
+                  break;
+                }
+              }
+
+              if (idx < 0 || !parts[idx + 1]) {
+                return null;
+              }
+
+              let name;
+
+              if (parts[idx + 1].startsWith("@")) {
+                if (!parts[idx + 2]) {
+                  return null;
+                }
+
+                name =
+                  `${parts[idx + 1]}/${parts[idx + 2]}`;
+              } else {
+                name = parts[idx + 1];
+              }
+
+              return {
+                key: normalizedKey,
+                name,
+                version:
+                  typeof entry.version === "string"
+                    ? entry.version
+                    : null,
+                entry,
+              };
+            })
+            .filter(Boolean);
+
+          const lockByKey = new Map(
+            lockEntries.map((item) => [
+              item.key,
+              item,
+            ])
+          );
+
+          const lockByName = new Map();
+
+          for (const item of lockEntries) {
+            if (!lockByName.has(item.name)) {
+              lockByName.set(item.name, []);
+            }
+
+            lockByName.get(item.name).push(item);
+          }
+
+          const lockKeysLongestFirst =
+            [...lockByKey.keys()].sort(
+              (a, b) => b.length - a.length
+            );
+
+          const normalizeSourceText = (value) => {
+            let text = String(value || "")
+              .replace(/\\/g, "/");
+
+            try {
+              text = decodeURIComponent(text);
+            } catch {
+              // Preserve the original text when URI decoding fails.
+            }
+
+            if (text.startsWith("\0")) {
+              text = text.slice(1);
+            }
+
+            return text;
+          };
+
+          const sourcePackageName = (source) => {
+            const normalized =
+              normalizeSourceText(source);
+
+            const marker = "/node_modules/";
+            let idx =
+              normalized.lastIndexOf(marker);
+
+            let tail;
+
+            if (idx >= 0) {
+              tail = normalized.slice(
+                idx + marker.length
+              );
+            } else if (
+              normalized.startsWith("node_modules/")
+            ) {
+              tail = normalized.slice(
+                "node_modules/".length
+              );
+            } else {
+              return null;
+            }
+
+            const parts = tail.split("/");
+
+            if (!parts[0]) {
+              return null;
+            }
+
+            if (parts[0].startsWith("@")) {
+              if (!parts[1]) {
+                return null;
+              }
+
+              return `${parts[0]}/${parts[1]}`;
+            }
+
+            return parts[0];
+          };
+
+          const nearestLockKeyForAbsolutePath =
+            (absPath) => {
+              let current = absPath;
+
+              try {
+                if (
+                  fs.existsSync(current) &&
+                  fs.statSync(current).isFile()
+                ) {
+                  current = path.dirname(current);
+                }
+              } catch {
+                return null;
+              }
+
+              const uiPrefix =
+                uiRoot.endsWith(path.sep)
+                  ? uiRoot
+                  : `${uiRoot}${path.sep}`;
+
+              while (
+                current === uiRoot ||
+                current.startsWith(uiPrefix)
+              ) {
+                const rel = path
+                  .relative(uiRoot, current)
+                  .replace(/\\/g, "/");
+
+                if (lockByKey.has(rel)) {
+                  return rel;
+                }
+
+                const parent = path.dirname(current);
+
+                if (parent === current) {
+                  break;
+                }
+
+                current = parent;
+              }
+
+              return null;
+            };
+
+          const resolveSourceCandidates =
+            (rawSource, mapFile, sourceRoot) => {
+              let combined = rawSource;
+
+              if (
+                sourceRoot &&
+                typeof sourceRoot === "string"
+              ) {
+                const root =
+                  normalizeSourceText(sourceRoot);
+
+                if (root) {
+                  combined =
+                    `${root.replace(/\/+$/, "")}/` +
+                    `${String(rawSource).replace(/^\/+/, "")}`;
+                }
+              }
+
+              let normalized =
+                normalizeSourceText(combined);
+
+              normalized =
+                normalized
+                  .replace(/[?#].*$/, "");
+
+              const candidates = [];
+
+              if (
+                normalized.startsWith("file://")
+              ) {
+                try {
+                  candidates.push(
+                    fileURLToPath(normalized)
+                  );
+                } catch {
+                  // Continue with string matching.
+                }
+              } else if (
+                path.isAbsolute(normalized)
+              ) {
+                candidates.push(
+                  path.normalize(normalized)
+                );
+              } else {
+                candidates.push(
+                  path.resolve(
+                    path.dirname(mapFile),
+                    normalized
+                  )
+                );
+
+                candidates.push(
+                  path.resolve(
+                    uiRoot,
+                    normalized
+                  )
+                );
+              }
+
+              return [...new Set(candidates)];
+            };
+
+          const identifyLockKey = (
+            rawSource,
+            mapFile,
+            sourceRoot
+          ) => {
+            const normalized =
+              normalizeSourceText(rawSource);
+
+            for (const key of lockKeysLongestFirst) {
+              const marker = `/${key}/`;
+
+              if (
+                normalized.includes(marker) ||
+                normalized.endsWith(`/${key}`) ||
+                normalized.startsWith(`${key}/`) ||
+                normalized === key
+              ) {
+                return {
+                  key,
+                  method: "lock-key-source-match",
+                };
+              }
+            }
+
+            for (
+              const candidate of
+              resolveSourceCandidates(
+                rawSource,
+                mapFile,
+                sourceRoot
+              )
+            ) {
+              if (!fs.existsSync(candidate)) {
+                continue;
+              }
+
+              const key =
+                nearestLockKeyForAbsolutePath(
+                  candidate
+                );
+
+              if (key) {
+                return {
+                  key,
+                  method: "resolved-source-path",
+                };
+              }
+            }
+
+            const name =
+              sourcePackageName(rawSource);
+
+            if (!name) {
+              return null;
+            }
+
+            const candidates =
+              lockByName.get(name) || [];
+
+            if (candidates.length === 1) {
+              return {
+                key: candidates[0].key,
+                method:
+                  "unique-package-name-fallback",
+              };
+            }
+
+            const versions = [
+              ...new Set(
+                candidates
+                  .map((item) => item.version)
+                  .filter(Boolean)
+              ),
+            ];
+
+            if (
+              candidates.length > 1 &&
+              versions.length === 1
+            ) {
+              return {
+                key: candidates
+                  .map((item) => item.key)
+                  .sort()[0],
+                method:
+                  "same-version-package-name-fallback",
+              };
+            }
+
+            return {
+              ambiguous: true,
+              packageName: name,
+              candidateKeys:
+                candidates.map((item) => ({
+                  key: item.key,
+                  version: item.version,
+                })),
+            };
+          };
+
+          const usedLockKeys = new Set();
+          const sourceEvidence = new Map();
+          const mappingUnresolved = [];
+
+          let productionSourceCount = 0;
+
+          const recordSource = (
+            source,
+            mapFile,
+            sourceRoot
+          ) => {
+            if (
+              typeof source !== "string" ||
+              !source
+            ) {
+              return;
+            }
+
+            productionSourceCount++;
+
+            const normalized =
+              normalizeSourceText(source);
+
+            if (
+              !normalized.includes("node_modules/")
+            ) {
+              return;
+            }
+
+            const match =
+              identifyLockKey(
+                source,
+                mapFile,
+                sourceRoot
+              );
+
+            if (!match) {
+              mappingUnresolved.push({
+                problem:
+                  "node_modules source could not be mapped to package-lock",
+                source,
+                map:
+                  path
+                    .relative(outDir, mapFile)
+                    .replace(/\\/g, "/"),
+              });
+
+              return;
+            }
+
+            if (match.ambiguous) {
+              mappingUnresolved.push({
+                problem:
+                  "production source maps to multiple installed package versions",
+                source,
+                map:
+                  path
+                    .relative(outDir, mapFile)
+                    .replace(/\\/g, "/"),
+                packageName:
+                  match.packageName,
+                candidates:
+                  match.candidateKeys,
+              });
+
+              return;
+            }
+
+            usedLockKeys.add(match.key);
+
+            if (!sourceEvidence.has(match.key)) {
+              sourceEvidence.set(
+                match.key,
+                []
+              );
+            }
+
+            const evidence =
+              sourceEvidence.get(match.key);
+
+            if (evidence.length < 10) {
+              evidence.push({
+                source,
+                map:
+                  path
+                    .relative(outDir, mapFile)
+                    .replace(/\\/g, "/"),
+                method:
+                  match.method,
+              });
+            }
+          };
+
+          const inspectMapObject = (
+            obj,
+            mapFile,
+            inheritedSourceRoot = ""
+          ) => {
+            if (!obj || typeof obj !== "object") {
+              return;
+            }
+
+            const sourceRoot =
+              typeof obj.sourceRoot === "string"
+                ? obj.sourceRoot
+                : inheritedSourceRoot;
+
+            if (Array.isArray(obj.sources)) {
+              for (const source of obj.sources) {
+                recordSource(
+                  source,
+                  mapFile,
+                  sourceRoot
+                );
+              }
+            }
+
+            if (Array.isArray(obj.sections)) {
+              for (const section of obj.sections) {
+                if (
+                  section &&
+                  typeof section === "object" &&
+                  section.map
+                ) {
+                  inspectMapObject(
+                    section.map,
+                    mapFile,
+                    sourceRoot
+                  );
+                }
+              }
+            }
+          };
+
+          for (const mapFile of mapFiles) {
+            let map;
+
+            try {
+              map = JSON.parse(
+                fs.readFileSync(
+                  mapFile,
+                  "utf8"
+                )
+              );
+            } catch (err) {
+              mappingUnresolved.push({
+                problem:
+                  "production source map could not be parsed",
+                map:
+                  path
+                    .relative(outDir, mapFile)
+                    .replace(/\\/g, "/"),
+                detail: String(err),
+              });
+
+              continue;
+            }
+
+            inspectMapObject(
+              map,
+              mapFile
+            );
+          }
+
+          if (productionSourceCount === 0) {
+            throw new Error(
+              "Production source maps contained zero source entries"
+            );
+          }
+
+          if (usedLockKeys.size === 0) {
+            throw new Error(
+              "Production source maps resolved zero node_modules packages"
+            );
+          }
+
           const licenseNamePattern =
             /^(licen[sc]e|copying|notice|unlicense)([._-].*)?$/i;
 
-          const reviewPattern =
+          const dangerousLicensePattern =
             /\b(AGPL|GPL|LGPL|SSPL|BUSL|BSL-1\.1|Commons Clause|NonCommercial|NON-COMMERCIAL)\b/i;
 
+          const safeLicenceIds = new Set([
+            "MIT",
+            "MIT-0",
+            "ISC",
+            "0BSD",
+            "BSD",
+            "BSD-2-Clause",
+            "BSD-3-Clause",
+            "Apache-2.0",
+            "CC0-1.0",
+            "Unlicense",
+            "Zlib",
+            "OFL-1.1",
+          ]);
+
+          const looksLikeMIT = (text) =>
+            text.includes(
+              "Permission is hereby granted, free of charge"
+            ) &&
+            text.includes(
+              'THE SOFTWARE IS PROVIDED "AS IS"'
+            );
+
+          const isSafeLicenceExpression =
+            (value) => {
+              if (
+                typeof value !== "string" ||
+                !value.trim()
+              ) {
+                return false;
+              }
+
+              if (
+                dangerousLicensePattern.test(value) ||
+                /\bWITH\b/i.test(value)
+              ) {
+                return false;
+              }
+
+              const stripped =
+                value
+                  .replace(/[()]/g, " ")
+                  .trim();
+
+              const pieces =
+                stripped
+                  .split(/\s+(?:AND|OR)\s+/i)
+                  .map((item) => item.trim())
+                  .filter(Boolean);
+
+              return (
+                pieces.length > 0 &&
+                pieces.every((item) =>
+                  safeLicenceIds.has(item)
+                )
+              );
+            };
+
           const entries = [];
-          const unresolved = [];
-          const seen = new Set();
+          const unresolved = [
+            ...mappingUnresolved,
+          ];
 
-          let lockPackageEntries = 0;
-          let installedUniquePackages = 0;
+          const seenPackageVersions =
+            new Set();
 
-          for (const [lockKey, lockEntry] of Object.entries(lock.packages)) {
-            if (!lockKey || !lockKey.includes("node_modules/")) {
-              continue;
-            }
+          const usedItems = [
+            ...usedLockKeys
+          ]
+            .map((key) => {
+              const item = lockByKey.get(key);
 
-            lockPackageEntries++;
+              if (!item) {
+                unresolved.push({
+                  problem:
+                    "source-map-selected lock key missing from package-lock index",
+                  lockKey: key,
+                });
+              }
 
-            const abs = path.join(uiRoot, lockKey);
+              return item;
+            })
+            .filter(Boolean)
+            .sort((a, b) =>
+              `${a.name}@${a.version}:${a.key}`
+                .localeCompare(
+                  `${b.name}@${b.version}:${b.key}`
+                )
+            );
 
-            if (!fs.existsSync(abs)) {
-              continue;
-            }
+          for (const item of usedItems) {
+            const abs =
+              path.join(uiRoot, item.key);
 
-            const pkgJsonPath = path.join(abs, "package.json");
+            const pkgJsonPath =
+              path.join(abs, "package.json");
 
             if (!fs.existsSync(pkgJsonPath)) {
+              unresolved.push({
+                lockKey: item.key,
+                problem:
+                  "production package package.json missing",
+              });
+
               continue;
             }
 
@@ -547,83 +1246,165 @@ jobs:
 
             try {
               pkg = JSON.parse(
-                fs.readFileSync(pkgJsonPath, "utf8")
+                fs.readFileSync(
+                  pkgJsonPath,
+                  "utf8"
+                )
               );
             } catch (err) {
               unresolved.push({
-                lockKey,
-                problem: "package.json could not be parsed",
-                detail: String(err),
+                lockKey: item.key,
+                problem:
+                  "production package package.json could not be parsed",
+                detail:
+                  String(err),
               });
+
               continue;
             }
 
             const name =
-              typeof pkg.name === "string" && pkg.name
+              typeof pkg.name === "string" &&
+              pkg.name
                 ? pkg.name
-                : lockEntry.name || lockKey;
+                : item.name;
 
             const version =
-              typeof pkg.version === "string" && pkg.version
+              typeof pkg.version === "string" &&
+              pkg.version
                 ? pkg.version
-                : lockEntry.version || "UNKNOWN";
+                : item.version || "UNKNOWN";
 
-            const dedupeKey = `${name}@${version}`;
+            const dedupeKey =
+              `${name}@${version}`;
 
-            if (seen.has(dedupeKey)) {
+            if (
+              seenPackageVersions.has(
+                dedupeKey
+              )
+            ) {
               continue;
             }
 
-            seen.add(dedupeKey);
-            installedUniquePackages++;
+            seenPackageVersions.add(
+              dedupeKey
+            );
 
             let declaredLicense = "";
 
-            if (typeof pkg.license === "string") {
-              declaredLicense = pkg.license.trim();
+            if (
+              typeof pkg.license === "string"
+            ) {
+              declaredLicense =
+                pkg.license.trim();
             } else if (
               pkg.license &&
-              typeof pkg.license.type === "string"
+              typeof pkg.license.type ===
+                "string"
             ) {
-              declaredLicense = pkg.license.type.trim();
-            } else if (Array.isArray(pkg.licenses)) {
-              declaredLicense = pkg.licenses
-                .map((x) =>
-                  typeof x === "string"
-                    ? x
-                    : x && typeof x.type === "string"
-                      ? x.type
-                      : ""
-                )
-                .filter(Boolean)
-                .join(" OR ");
-            } else if (typeof lockEntry.license === "string") {
-              declaredLicense = lockEntry.license.trim();
+              declaredLicense =
+                pkg.license.type.trim();
+            } else if (
+              Array.isArray(pkg.licenses)
+            ) {
+              declaredLicense =
+                pkg.licenses
+                  .map((x) =>
+                    typeof x === "string"
+                      ? x
+                      : x &&
+                          typeof x.type ===
+                            "string"
+                        ? x.type
+                        : ""
+                  )
+                  .filter(Boolean)
+                  .join(" OR ");
+            } else if (
+              typeof item.entry.license ===
+                "string"
+            ) {
+              declaredLicense =
+                item.entry.license.trim();
             }
 
-            const topNames = fs.readdirSync(abs);
+            const requestedLicenceFiles =
+              new Set();
 
-            const sourceLicenseFiles = topNames
-              .filter((name) => licenseNamePattern.test(name))
-              .sort((a, b) => a.localeCompare(b));
+            for (
+              const fileName of
+              fs.readdirSync(abs)
+            ) {
+              if (
+                licenseNamePattern.test(
+                  fileName
+                )
+              ) {
+                requestedLicenceFiles.add(
+                  fileName
+                );
+              }
+            }
 
-            const packageDir = path.join(
-              npmLicenseRoot,
-              safeName(`${name}@${version}`)
+            const seeLicenseMatch =
+              declaredLicense.match(
+                /^SEE LICENSE IN\s+(.+)$/i
+              );
+
+            if (seeLicenseMatch) {
+              const relativeLicense =
+                seeLicenseMatch[1].trim();
+
+              if (
+                relativeLicense.includes("..") ||
+                path.isAbsolute(
+                  relativeLicense
+                )
+              ) {
+                unresolved.push({
+                  package: dedupeKey,
+                  problem:
+                    "unsafe SEE LICENSE IN path",
+                  declaredLicense,
+                });
+              } else {
+                requestedLicenceFiles.add(
+                  relativeLicense
+                );
+              }
+            }
+
+            const packageDir =
+              path.join(
+                npmLicenseRoot,
+                safeName(dedupeKey)
+              );
+
+            fs.mkdirSync(
+              packageDir,
+              { recursive: true }
             );
 
-            fs.mkdirSync(packageDir, { recursive: true });
-
             const copiedLicenses = [];
+            const licenceTexts = [];
 
-            for (let i = 0; i < sourceLicenseFiles.length; i++) {
-              const sourceName = sourceLicenseFiles[i];
-              const sourcePath = path.join(abs, sourceName);
+            let copyIndex = 0;
+
+            for (
+              const sourceName of
+              [...requestedLicenceFiles]
+                .sort((a, b) =>
+                  a.localeCompare(b)
+                )
+            ) {
+              const sourcePath =
+                path.join(abs, sourceName);
 
               let stat;
 
               try {
-                stat = fs.statSync(sourcePath);
+                stat =
+                  fs.statSync(sourcePath);
               } catch {
                 continue;
               }
@@ -632,105 +1413,246 @@ jobs:
                 continue;
               }
 
-              const data = fs.readFileSync(sourcePath);
+              copyIndex++;
+
+              const data =
+                fs.readFileSync(sourcePath);
+
+              const text =
+                data.toString("utf8");
+
+              licenceTexts.push(text);
 
               const targetName =
-                `${String(i + 1).padStart(2, "0")}-` +
-                safeName(sourceName) +
+                `${String(copyIndex)
+                  .padStart(2, "0")}-` +
+                safeName(
+                  path.basename(sourceName)
+                ) +
                 ".txt";
 
-              const targetPath = path.join(
-                packageDir,
-                targetName
-              );
+              const targetPath =
+                path.join(
+                  packageDir,
+                  targetName
+                );
 
-              fs.writeFileSync(targetPath, data);
+              fs.writeFileSync(
+                targetPath,
+                data
+              );
 
               copiedLicenses.push({
                 sourceName,
-                bundledPath: path
-                  .relative(legalRoot, targetPath)
-                  .split(path.sep)
-                  .join("/"),
-                sha256: sha256(data),
-                bytes: data.length,
+                bundledPath:
+                  path
+                    .relative(
+                      legalRoot,
+                      targetPath
+                    )
+                    .split(path.sep)
+                    .join("/"),
+                sha256:
+                  sha256(data),
+                bytes:
+                  data.length,
               });
             }
 
-            const item = {
-              name,
-              version,
-              declaredLicense:
-                declaredLicense || "UNKNOWN",
-              lockKey,
-              integrity:
-                typeof lockEntry.integrity === "string"
-                  ? lockEntry.integrity
-                  : null,
-              resolved:
-                typeof lockEntry.resolved === "string"
-                  ? lockEntry.resolved
-                  : null,
-              licenseFiles: copiedLicenses,
-            };
+            const combinedLicenceText =
+              licenceTexts.join("\n\n");
 
-            entries.push(item);
+            let effectiveLicense =
+              declaredLicense || "";
 
-            if (!declaredLicense) {
-              unresolved.push({
-                package: dedupeKey,
-                problem: "missing declared licence metadata",
-              });
-            }
+            let licenceBasis =
+              declaredLicense
+                ? "package metadata"
+                : "";
 
-            if (copiedLicenses.length === 0) {
-              unresolved.push({
-                package: dedupeKey,
-                problem: "no top-level licence/notice text found in installed package",
-                declaredLicense:
-                  declaredLicense || "UNKNOWN",
-              });
+            if (
+              !effectiveLicense &&
+              licenceTexts.length > 0 &&
+              looksLikeMIT(
+                combinedLicenceText
+              ) &&
+              !dangerousLicensePattern.test(
+                combinedLicenceText
+              )
+            ) {
+              effectiveLicense =
+                "MIT";
+
+              licenceBasis =
+                "bundled licence text";
             }
 
             if (
-              declaredLicense &&
-              (
-                reviewPattern.test(declaredLicense) ||
-                /SEE LICENSE IN/i.test(declaredLicense) ||
-                /UNLICENSED/i.test(declaredLicense) ||
-                /UNKNOWN/i.test(declaredLicense)
+              seeLicenseMatch &&
+              copiedLicenses.length > 0
+            ) {
+              if (
+                looksLikeMIT(
+                  combinedLicenceText
+                ) &&
+                !dangerousLicensePattern.test(
+                  combinedLicenceText
+                )
+              ) {
+                effectiveLicense =
+                  "MIT";
+
+                licenceBasis =
+                  "SEE LICENSE IN bundled MIT text";
+              } else {
+                effectiveLicense =
+                  declaredLicense;
+
+                licenceBasis =
+                  "SEE LICENSE IN bundled text";
+              }
+            }
+
+            const evidence =
+              sourceEvidence.get(
+                item.key
+              ) || [];
+
+            const inventoryItem = {
+              name,
+              version,
+              effectiveLicense:
+                effectiveLicense ||
+                "UNKNOWN",
+              declaredLicense:
+                declaredLicense ||
+                null,
+              licenceBasis:
+                licenceBasis ||
+                null,
+              lockKey:
+                item.key,
+              integrity:
+                typeof item.entry
+                  .integrity === "string"
+                  ? item.entry.integrity
+                  : null,
+              resolved:
+                typeof item.entry
+                  .resolved === "string"
+                  ? item.entry.resolved
+                  : null,
+              productionSourceEvidence:
+                evidence,
+              licenseFiles:
+                copiedLicenses,
+            };
+
+            entries.push(
+              inventoryItem
+            );
+
+            if (
+              copiedLicenses.length === 0
+            ) {
+              unresolved.push({
+                package:
+                  dedupeKey,
+                problem:
+                  "production-bundle package has no bundled licence/notice text",
+                declaredLicense:
+                  declaredLicense ||
+                  "UNKNOWN",
+              });
+            }
+
+            if (!effectiveLicense) {
+              unresolved.push({
+                package:
+                  dedupeKey,
+                problem:
+                  "production-bundle package licence could not be determined",
+              });
+            } else if (
+              dangerousLicensePattern.test(
+                effectiveLicense
+              ) ||
+              dangerousLicensePattern.test(
+                combinedLicenceText
               )
             ) {
               unresolved.push({
-                package: dedupeKey,
-                problem: "licence requires manual review",
-                declaredLicense,
+                package:
+                  dedupeKey,
+                problem:
+                  "production-bundle package licence requires manual review",
+                effectiveLicense,
+              });
+            } else if (
+              !seeLicenseMatch &&
+              !isSafeLicenceExpression(
+                effectiveLicense
+              )
+            ) {
+              unresolved.push({
+                package:
+                  dedupeKey,
+                problem:
+                  "production-bundle package licence is outside automated permissive allow-list",
+                effectiveLicense,
+              });
+            } else if (
+              seeLicenseMatch &&
+              effectiveLicense !== "MIT"
+            ) {
+              unresolved.push({
+                package:
+                  dedupeKey,
+                problem:
+                  "SEE LICENSE IN package requires manual review",
+                effectiveLicense,
               });
             }
           }
 
           entries.sort((a, b) =>
-            `${a.name}@${a.version}`.localeCompare(
-              `${b.name}@${b.version}`
-            )
+            `${a.name}@${a.version}`
+              .localeCompare(
+                `${b.name}@${b.version}`
+              )
           );
 
           unresolved.sort((a, b) =>
-            JSON.stringify(a).localeCompare(
-              JSON.stringify(b)
-            )
+            JSON.stringify(a)
+              .localeCompare(
+                JSON.stringify(b)
+              )
           );
 
           const inventory = {
             authority:
-              "ggml-org/llama.cpp exact b10516 tools/ui/package-lock.json",
+              "ggml-org/llama.cpp exact b10516 production Vite source maps + tools/ui/package-lock.json",
             packageLockVersion:
-              lock.lockfileVersion ?? null,
-            lockPackageEntries,
-            installedUniquePackages,
+              lock.lockfileVersion ??
+              null,
+            sourceMapCount:
+              mapFiles.length,
+            productionSourceEntries:
+              productionSourceCount,
+            redistributedUniquePackages:
+              entries.length,
+
+            // Compatibility field for the current
+            // downstream notice generator.
+            // It will be renamed in the next edit.
+            installedUniquePackages:
+              entries.length,
+
             note:
-              "Inventory is intentionally conservative and includes the exact installed UI build dependency tree. Build-only notices may therefore be over-inclusive.",
-            packages: entries,
+              "Only packages whose source code is referenced by the exact b10516 production Vite source maps are treated as redistributed embedded-UI packages. Build/test/platform-only packages that do not enter the production browser bundle are excluded.",
+
+            packages:
+              entries,
           };
 
           fs.writeFileSync(
@@ -738,23 +1660,78 @@ jobs:
               legalRoot,
               "UI_NPM_INVENTORY.json"
             ),
-            JSON.stringify(inventory, null, 2) + "\n",
+            JSON.stringify(
+              inventory,
+              null,
+              2
+            ) + "\n",
             "utf8"
           );
 
-          const unresolvedText = unresolved.length
-            ? [
-                "REVIEW REQUIRED",
-                "",
-                `Unresolved findings: ${unresolved.length}`,
-                "",
-                ...unresolved.map(
-                  (item, index) =>
-                    `${index + 1}. ${JSON.stringify(item)}`
-                ),
-                "",
-              ].join("\n")
-            : "NONE\n";
+          const packageSetText = [
+            "Nativa llama.cpp b10516 embedded UI",
+            "Production bundle package set",
+            "",
+            `Source maps: ${mapFiles.length}`,
+            `Production source entries: ${productionSourceCount}`,
+            `Redistributed unique packages: ${entries.length}`,
+            "",
+            ...entries.map(
+              (item) =>
+                `${item.name}@${item.version} | ` +
+                `${item.effectiveLicense}`
+            ),
+            "",
+          ].join("\n");
+
+          fs.writeFileSync(
+            path.join(
+              legalRoot,
+              "UI_PRODUCTION_PACKAGE_SET.txt"
+            ),
+            packageSetText,
+            "utf8"
+          );
+
+          const sourceMapText = [
+            "Nativa llama.cpp b10516 embedded UI",
+            "Production source maps",
+            "",
+            ...mapFiles.map(
+              (file) =>
+                path
+                  .relative(
+                    outDir,
+                    file
+                  )
+                  .replace(/\\/g, "/")
+            ),
+            "",
+          ].join("\n");
+
+          fs.writeFileSync(
+            path.join(
+              legalRoot,
+              "UI_PRODUCTION_SOURCE_MAPS.txt"
+            ),
+            sourceMapText,
+            "utf8"
+          );
+
+          const unresolvedText =
+            unresolved.length
+              ? [
+                  "REVIEW REQUIRED",
+                  "",
+                  `Unresolved findings: ${unresolved.length}`,
+                  "",
+                  ...unresolved.map(
+                    (item, index) =>
+                      `${index + 1}. ${JSON.stringify(item)}`
+                  ),
+                  "",
+                ].join("\n")
+              : "NONE\n";
 
           fs.writeFileSync(
             path.join(
@@ -770,19 +1747,28 @@ jobs:
               legalRoot,
               "UNRESOLVED_COUNT.txt"
             ),
-            String(unresolved.length) + "\n",
+            String(
+              unresolved.length
+            ) + "\n",
             "utf8"
           );
 
           console.log(
-            `UI packages inventoried: ${entries.length}`
+            `Production source maps: ${mapFiles.length}`
+          );
+
+          console.log(
+            `Production source entries: ${productionSourceCount}`
+          );
+
+          console.log(
+            `Redistributed UI packages: ${entries.length}`
           );
 
           console.log(
             `Unresolved findings: ${unresolved.length}`
           );
           NODE
-
       - name: Preserve frozen UI lockfile authority
         shell: bash
         run: |
@@ -841,11 +1827,20 @@ jobs:
           Embedded UI source:
           tools/ui from exact llama.cpp b10516
 
-          UI dependency authority:
+                   UI dependency/version authority:
           tools/ui/package-lock.json from exact llama.cpp b10516
 
           UI package-lock SHA-256:
           $UI_LOCK_SHA256
+
+          UI redistribution authority:
+          exact b10516 production Vite source maps
+
+          Production UI source-map count:
+          $UI_SOURCE_MAP_COUNT
+
+          UI inventory scope:
+          only node_modules packages whose source code is referenced by the production source maps
 
           Runtime binaries included in this legal bundle:
           NO
@@ -918,16 +1913,25 @@ jobs:
               "The official llama.cpp b10516 macOS release builds",
               "llama-server with the embedded llama-ui enabled.",
               "",
-              "The following npm inventory is derived from the exact",
-              "b10516 tools/ui/package-lock.json and an npm ci run",
-              "with lifecycle scripts disabled.",
+                            "The following npm inventory is derived from the exact",
+              "b10516 production Vite source maps together with the",
+              "exact tools/ui/package-lock.json.",
               "",
-              "The inventory is intentionally conservative and may",
-              "include build-time packages whose notices are not",
-              "strictly required in the final binary.",
+              "Only packages whose source code is referenced by the",
+              "production browser bundle source maps are treated as",
+              "redistributed embedded-UI packages.",
               "",
-              f"Unique installed packages inventoried: "
-              f"{inventory['installedUniquePackages']}",
+              "Build-only, test-only and runner-platform packages that",
+              "do not enter the production bundle are excluded.",
+              "",
+              f"Production source maps: "
+              f"{inventory['sourceMapCount']}",
+              "",
+              f"Redistributed embedded-UI packages inventoried: "
+              f"{inventory['redistributedUniquePackages']}",
+              "",
+              "See UI_PRODUCTION_PACKAGE_SET.txt and",
+              "UI_PRODUCTION_SOURCE_MAPS.txt for audit evidence.",
               "",
           ]
 
@@ -1322,13 +2326,16 @@ jobs:
                           f"Forbidden binary/model in ZIP: {name}"
                       )
 
-              required = {
+                           required = {
                   f"{prefix}LEGAL_SOURCE.txt",
                   f"{prefix}LEGAL_MANIFEST.sha256",
                   f"{prefix}THIRD_PARTY_NOTICES.txt",
                   f"{prefix}CPP_COMPONENT_INVENTORY.txt",
                   f"{prefix}UI_NPM_INVENTORY.json",
+                  f"{prefix}UI_PRODUCTION_PACKAGE_SET.txt",
+                  f"{prefix}UI_PRODUCTION_SOURCE_MAPS.txt",
                   f"{prefix}UNRESOLVED.txt",
+                  f"{prefix}UNRESOLVED_COUNT.txt",
               }
 
               missing = sorted(
@@ -1356,12 +2363,14 @@ jobs:
 
           legal="dist/$FINAL_ROOT/legal"
 
-          for name in \
+                    for name in \
             LEGAL_SOURCE.txt \
             LEGAL_MANIFEST.sha256 \
             THIRD_PARTY_NOTICES.txt \
             CPP_COMPONENT_INVENTORY.txt \
             UI_NPM_INVENTORY.json \
+            UI_PRODUCTION_PACKAGE_SET.txt \
+            UI_PRODUCTION_SOURCE_MAPS.txt \
             UNRESOLVED.txt \
             UNRESOLVED_COUNT.txt
           do
