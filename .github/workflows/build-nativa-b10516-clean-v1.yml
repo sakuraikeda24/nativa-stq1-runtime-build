@@ -1,0 +1,1402 @@
+name: Build Nativa b10516 clean runtime v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-validate-package:
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    env:
+      EXPECTED_LLAMA_COMMIT: b95502ba9aa0eb73a2f4fc8878d7fbe6a847a0b9
+
+      MODEL_URL: "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf?download=true"
+      MODEL_SHA256: dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699
+      MODEL_BYTES: "1133080448"
+
+      OFFICIAL_RUNTIME_URL: "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-win-cpu-x64.zip"
+      OFFICIAL_RUNTIME_SHA256: fbbbc55e0eb2e1b07f9dcb9488616c98ed47d9003b90e15e7c8c7812c4307cd3
+
+      FINAL_ROOT: llama-win-x64-b10516
+      FINAL_ZIP: nativa-llama-b10516-win-x64-clean-v1.zip
+
+    steps:
+      - name: Fetch exact llama.cpp b10516
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin refs/tags/b10516
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not fetch llama.cpp tag b10516"
+          }
+
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check out b10516"
+          }
+
+          $actual = (git -C llama.cpp rev-parse HEAD).Trim()
+
+          Write-Host "Expected commit: $env:EXPECTED_LLAMA_COMMIT"
+          Write-Host "Actual commit:   $actual"
+
+          if ($actual -ne $env:EXPECTED_LLAMA_COMMIT) {
+            throw "b10516 resolved to unexpected commit $actual"
+          }
+
+          Write-Host "Frozen upstream commit PASS"
+
+      - name: Configure clean Windows x64 runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S llama.cpp `
+            -B build `
+            -G "Visual Studio 18 2026" `
+            -A x64 `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_BUILD_COMMON=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_APP=OFF `
+            -DLLAMA_BUILD_UI=OFF `
+            -DLLAMA_USE_PREBUILT_UI=OFF `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_BORINGSSL=OFF `
+            -DLLAMA_BUILD_LIBRESSL=OFF `
+            -DLLAMA_LLGUIDANCE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_RPC=OFF `
+            -DGGML_CUDA=OFF `
+            -DGGML_VULKAN=OFF `
+            -DGGML_SYCL=OFF `
+            -DGGML_BLAS=OFF `
+            -DGGML_METAL=OFF `
+            -DGGML_OPENCL=OFF
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
+      - name: Verify frozen CMake options
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cache = Get-Content "build/CMakeCache.txt"
+
+          $required = @(
+            "^BUILD_SHARED_LIBS:BOOL=ON$",
+            "^LLAMA_BUILD_TOOLS:BOOL=ON$",
+            "^LLAMA_BUILD_SERVER:BOOL=ON$",
+            "^LLAMA_BUILD_UI:BOOL=OFF$",
+            "^LLAMA_USE_PREBUILT_UI:BOOL=OFF$",
+            "^LLAMA_OPENSSL:BOOL=OFF$",
+            "^LLAMA_BUILD_BORINGSSL:.*=OFF$",
+            "^LLAMA_BUILD_LIBRESSL:.*=OFF$",
+            "^LLAMA_LLGUIDANCE:BOOL=OFF$",
+            "^GGML_OPENMP:BOOL=OFF$",
+            "^GGML_NATIVE:BOOL=OFF$",
+            "^GGML_BACKEND_DL:BOOL=ON$",
+            "^GGML_CPU_ALL_VARIANTS:BOOL=ON$",
+            "^GGML_RPC:BOOL=OFF$",
+            "^GGML_CUDA:BOOL=OFF$",
+            "^GGML_VULKAN:BOOL=OFF$",
+            "^GGML_SYCL:BOOL=OFF$",
+            "^GGML_BLAS:BOOL=OFF$"
+          )
+
+          foreach ($pattern in $required) {
+            if (-not ($cache | Select-String -Pattern $pattern)) {
+              throw "Required CMake setting missing: $pattern"
+            }
+          }
+
+          Write-Host "Frozen CMake options PASS"
+
+      - name: Build llama-server Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            --build build `
+            --config Release `
+            --target llama-server `
+            --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "llama-server build failed"
+          }
+
+      - name: Stage exact clean runtime and formal VC Redist closure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $src = Resolve-Path "build/bin/Release"
+          $stage = Join-Path (Resolve-Path ".") "dist-clean\$env:FINAL_ROOT"
+
+          Remove-Item "dist-clean" -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $core = @(
+            "llama-server.exe",
+            "llama-server-impl.dll",
+            "llama-common.dll",
+            "llama.dll",
+            "mtmd.dll",
+            "ggml.dll",
+            "ggml-base.dll"
+          )
+
+          foreach ($name in $core) {
+            $file = Join-Path $src $name
+            if (-not (Test-Path $file)) {
+              throw "Required runtime binary missing: $name"
+            }
+            Copy-Item $file $stage
+          }
+
+          $cpuDlls = @(
+            Get-ChildItem $src -Filter "ggml-cpu-*.dll" -File |
+            Sort-Object Name
+          )
+
+          if ($cpuDlls.Count -ne 9) {
+            throw "Expected exactly 9 CPU backend DLLs, got $($cpuDlls.Count)"
+          }
+
+          foreach ($file in $cpuDlls) {
+            Copy-Item $file.FullName $stage
+          }
+
+          Write-Host "===== CLEAN LLAMA RUNTIME ====="
+          Get-ChildItem $stage -File |
+            Sort-Object Name |
+            Format-Table Name, Length
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found"
+          }
+
+          $vsInstall = (& $vswhere -latest -products * -property installationPath).Trim()
+
+          if (-not $vsInstall) {
+            throw "Visual Studio installation could not be resolved"
+          }
+
+          $redistRoot = Join-Path $vsInstall "VC\Redist\MSVC"
+
+          if (-not (Test-Path $redistRoot)) {
+            throw "Formal VC Redist root not found: $redistRoot"
+          }
+
+          $crtCandidate = Get-ChildItem $redistRoot -Recurse -Filter "msvcp140.dll" -File |
+            Where-Object {
+              $_.FullName -match "\\x64\\" -and
+              $_.FullName -notmatch "debug_nonredist"
+            } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $crtCandidate) {
+            throw "Could not locate formal x64 msvcp140.dll under VC Redist"
+          }
+
+          $crtDir = $crtCandidate.Directory.FullName
+
+          if ($crtDir -match "debug_nonredist") {
+            throw "STOP: selected VC runtime came from debug_nonredist"
+          }
+
+          if (-not $crtDir.StartsWith($redistRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "STOP: selected VC runtime is outside the formal VC Redist tree"
+          }
+
+          Write-Host "Formal VC Redist directory:"
+          Write-Host $crtDir
+
+          $toolRoot = Join-Path $vsInstall "VC\Tools\MSVC"
+          $toolDir = Get-ChildItem $toolRoot -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          if (-not $toolDir) {
+            throw "MSVC tools directory not found"
+          }
+
+          $dumpbin = Join-Path $toolDir.FullName "bin\Hostx64\x64\dumpbin.exe"
+
+          if (-not (Test-Path $dumpbin)) {
+            throw "dumpbin.exe not found"
+          }
+
+          function Get-Dependencies([string]$filePath) {
+            $raw = & $dumpbin /DEPENDENTS $filePath 2>&1
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $filePath"
+            }
+
+            $deps = @()
+
+            foreach ($line in $raw) {
+              if ($line -match "^\s+([A-Za-z0-9._-]+\.dll)\s*$") {
+                $deps += $Matches[1]
+              }
+            }
+
+            return @($deps | Sort-Object -Unique)
+          }
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          $seen = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+
+          foreach ($file in Get-ChildItem $stage -File |
+            Where-Object { $_.Extension -in ".exe", ".dll" }) {
+
+            foreach ($dep in @(Get-Dependencies $file.FullName)) {
+              if (Test-Path (Join-Path $crtDir $dep)) {
+                $queue.Enqueue($dep)
+              }
+            }
+          }
+
+          $vcCopied = @()
+
+          while ($queue.Count -gt 0) {
+            $name = $queue.Dequeue()
+
+            if (-not $seen.Add($name)) {
+              continue
+            }
+
+            $source = Join-Path $crtDir $name
+
+            if (-not (Test-Path $source)) {
+              throw "VC dependency was expected in formal Redist but missing: $name"
+            }
+
+            Copy-Item $source (Join-Path $stage $name)
+            $vcCopied += $name
+
+            foreach ($dep in @(Get-Dependencies $source)) {
+              if ((Test-Path (Join-Path $crtDir $dep)) -and -not $seen.Contains($dep)) {
+                $queue.Enqueue($dep)
+              }
+            }
+          }
+
+          if ($vcCopied.Count -eq 0) {
+            throw "No formal VC Redistributable DLLs were copied"
+          }
+
+          $vcCopied = @($vcCopied | Sort-Object -Unique)
+
+          Write-Host "===== FORMAL VC REDIST CLOSURE ====="
+          $vcCopied | ForEach-Object { Write-Host $_ }
+
+          Set-Content `
+            -Path (Join-Path $stage "VC_REDIST_FILES.txt") `
+            -Value ($vcCopied -join "`n") `
+            -Encoding utf8
+
+          "VC_REDIST_SOURCE=$crtDir" >> $env:GITHUB_ENV
+          "CLEAN_BIN_DIR=$stage" >> $env:GITHUB_ENV
+
+      - name: Full PE dependency audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = (& $vswhere -latest -products * -property installationPath).Trim()
+
+          $toolRoot = Join-Path $vsInstall "VC\Tools\MSVC"
+          $toolDir = Get-ChildItem $toolRoot -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          $dumpbin = Join-Path $toolDir.FullName "bin\Hostx64\x64\dumpbin.exe"
+
+          if (-not (Test-Path $dumpbin)) {
+            throw "dumpbin.exe not found"
+          }
+
+          $stage = $env:CLEAN_BIN_DIR
+
+          $forbiddenPattern = "(?i)(libomp|vcomp|libssl|libcrypto|boringssl|libressl|cudart|cublas|vulkan|sycl|opencl)"
+
+          $report = [System.Collections.Generic.List[string]]::new()
+
+          foreach ($file in Get-ChildItem $stage -File |
+            Where-Object { $_.Extension -in ".exe", ".dll" } |
+            Sort-Object Name) {
+
+            if ($file.Name -match $forbiddenPattern) {
+              throw "Forbidden runtime file found: $($file.Name)"
+            }
+
+            $raw = & $dumpbin /DEPENDENTS $file.FullName 2>&1
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $($file.Name)"
+            }
+
+            $deps = @()
+
+            foreach ($line in $raw) {
+              if ($line -match "^\s+([A-Za-z0-9._-]+\.dll)\s*$") {
+                $deps += $Matches[1]
+              }
+            }
+
+            $deps = @($deps | Sort-Object -Unique)
+
+            $report.Add("[$($file.Name)]")
+
+            foreach ($dep in $deps) {
+              $report.Add("  $dep")
+
+              if ($dep -match $forbiddenPattern) {
+                throw "Forbidden PE dependency found: $($file.Name) -> $dep"
+              }
+            }
+
+            $report.Add("")
+          }
+
+          Set-Content `
+            -Path (Join-Path $stage "DEPENDENCIES.txt") `
+            -Value $report `
+            -Encoding utf8
+
+          if (Get-ChildItem $stage -Recurse -Filter "*.gguf" -File) {
+            throw "STOP: a GGUF model entered the runtime staging directory"
+          }
+
+          if ($env:VC_REDIST_SOURCE -match "debug_nonredist") {
+            throw "STOP: VC Redist provenance contains debug_nonredist"
+          }
+
+          Write-Host "Full PE dependency audit PASS"
+
+      - name: Download and verify exact Hy-MT2 validation model
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "model" | Out-Null
+          $model = Join-Path (Resolve-Path "model") "model.gguf"
+
+          curl.exe `
+            -L `
+            --fail `
+            --retry 3 `
+            --retry-delay 5 `
+            -o $model `
+            $env:MODEL_URL
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Hy-MT2 model download failed"
+          }
+
+          $size = (Get-Item $model).Length
+          $expectedSize = [int64]$env:MODEL_BYTES
+
+          Write-Host "Model bytes expected: $expectedSize"
+          Write-Host "Model bytes actual:   $size"
+
+          if ($size -ne $expectedSize) {
+            throw "Hy-MT2 model byte length mismatch"
+          }
+
+          $hash = (Get-FileHash $model -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "Model SHA expected: $env:MODEL_SHA256"
+          Write-Host "Model SHA actual:   $hash"
+
+          if ($hash -ne $env:MODEL_SHA256) {
+            throw "Hy-MT2 model SHA-256 mismatch"
+          }
+
+          "MODEL_PATH=$model" >> $env:GITHUB_ENV
+
+          Write-Host "Exact Hy-MT2 validation model PASS"
+
+      - name: Download and verify current official b10516 baseline runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "official-runtime" | Out-Null
+
+          $archive = Join-Path (Resolve-Path "official-runtime") "official.zip"
+
+          curl.exe `
+            -L `
+            --fail `
+            --retry 3 `
+            --retry-delay 5 `
+            -o $archive `
+            $env:OFFICIAL_RUNTIME_URL
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Official b10516 runtime download failed"
+          }
+
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "Official runtime SHA expected: $env:OFFICIAL_RUNTIME_SHA256"
+          Write-Host "Official runtime SHA actual:   $hash"
+
+          if ($hash -ne $env:OFFICIAL_RUNTIME_SHA256) {
+            throw "Official b10516 runtime SHA-256 mismatch"
+          }
+
+          $extract = Join-Path (Resolve-Path "official-runtime") "expanded"
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+
+          Expand-Archive `
+            -Path $archive `
+            -DestinationPath $extract `
+            -Force
+
+          $server = Get-ChildItem $extract -Recurse -Filter "llama-server.exe" -File |
+            Select-Object -First 1
+
+          if (-not $server) {
+            throw "Official llama-server.exe not found after extraction"
+          }
+
+          "OFFICIAL_BIN_DIR=$($server.Directory.FullName)" >> $env:GITHUB_ENV
+
+          Write-Host "Official b10516 baseline ready"
+          Write-Host $server.Directory.FullName
+
+      - name: Functional validation and A-B benchmark
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $modelPath = $env:MODEL_PATH
+          $cleanDir = $env:CLEAN_BIN_DIR
+          $officialDir = $env:OFFICIAL_BIN_DIR
+
+          $logical = [Environment]::ProcessorCount
+          $threads = [Math]::Max(1, [Math]::Min(8, $logical - 1))
+
+          if ($logical -le 1) {
+            $threads = 1
+          }
+
+          $apiKey = "nativa-b10516-validation-0123456789abcdef0123456789abcdef"
+
+          Write-Host "Logical processors: $logical"
+          Write-Host "Nativa-equivalent thread count: $threads"
+
+          function Start-TestServer(
+            [string]$dir,
+            [int]$port,
+            [string]$tag
+          ) {
+            $exe = Join-Path $dir "llama-server.exe"
+
+            if (-not (Test-Path $exe)) {
+              throw "llama-server.exe missing in $dir"
+            }
+
+            $stderr = Join-Path $env:RUNNER_TEMP "$tag-$port.stderr.log"
+            $stdout = Join-Path $env:RUNNER_TEMP "$tag-$port.stdout.log"
+
+            Remove-Item $stderr, $stdout -Force -ErrorAction SilentlyContinue
+
+            $args = @(
+              "--model", $modelPath,
+              "--host", "127.0.0.1",
+              "--port", "$port",
+              "--ctx-size", "2048",
+              "--threads", "$threads",
+              "--no-warmup",
+              "--api-key", $apiKey
+            )
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+            $process = Start-Process `
+              -FilePath $exe `
+              -ArgumentList $args `
+              -WorkingDirectory $dir `
+              -PassThru `
+              -WindowStyle Hidden `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr
+
+            $deadline = (Get-Date).AddSeconds(120)
+            $healthy = $false
+
+            while ((Get-Date) -lt $deadline) {
+              if ($process.HasExited) {
+                $tail = ""
+
+                if (Test-Path $stderr) {
+                  $tail = (Get-Content $stderr -Tail 30) -join "`n"
+                }
+
+                throw "$tag server exited during startup.`n$tail"
+              }
+
+              try {
+                $health = Invoke-RestMethod `
+                  -Uri "http://127.0.0.1:$port/health" `
+                  -Headers @{ Authorization = "Bearer $apiKey" } `
+                  -Method Get `
+                  -TimeoutSec 2
+
+                if ($null -eq $health -or $health.status -eq "ok") {
+                  $healthy = $true
+                  break
+                }
+              } catch {
+                # Still loading.
+              }
+
+              Start-Sleep -Milliseconds 250
+            }
+
+            $sw.Stop()
+
+            if (-not $healthy) {
+              try {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              } catch {}
+
+              throw "$tag server did not become healthy within 120 seconds"
+            }
+
+            return [pscustomobject]@{
+              Process = $process
+              StartupMs = [double]$sw.Elapsed.TotalMilliseconds
+              Port = $port
+              Tag = $tag
+            }
+          }
+
+          function Stop-TestServer($server) {
+            if ($null -eq $server) {
+              return
+            }
+
+            try {
+              if (-not $server.Process.HasExited) {
+                Stop-Process `
+                  -Id $server.Process.Id `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                Wait-Process `
+                  -Id $server.Process.Id `
+                  -Timeout 10 `
+                  -ErrorAction SilentlyContinue
+              }
+            } catch {}
+
+            Start-Sleep -Milliseconds 400
+          }
+
+          function Invoke-TestTranslation(
+            [int]$port,
+            [string]$target,
+            [string]$text
+          ) {
+            $prompt = "Translate the following text into $target. Note that you should only output the translated result without any additional explanation:`n$text"
+
+            $payload = @{
+              messages = @(
+                @{
+                  role = "user"
+                  content = $prompt
+                }
+              )
+              temperature = 0.7
+              top_p = 0.6
+              top_k = 20
+              repeat_penalty = 1.05
+              seed = 42
+              max_tokens = 512
+              stream = $false
+            } | ConvertTo-Json -Depth 8 -Compress
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+            $response = Invoke-RestMethod `
+              -Uri "http://127.0.0.1:$port/v1/chat/completions" `
+              -Method Post `
+              -Headers @{ Authorization = "Bearer $apiKey" } `
+              -ContentType "application/json" `
+              -Body $payload `
+              -TimeoutSec 30
+
+            $sw.Stop()
+
+            $output = [string]$response.choices[0].message.content
+            $output = $output.Trim()
+
+            if (-not $output) {
+              throw "Translation returned empty output"
+            }
+
+            if ($output -eq $text) {
+              throw "Translation output was identical to the source text"
+            }
+
+            return [pscustomobject]@{
+              Output = $output
+              LatencyMs = [double]$sw.Elapsed.TotalMilliseconds
+            }
+          }
+
+          function Assert-English([string]$output) {
+            if ($output -notmatch "[A-Za-z]") {
+              throw "English translation validation failed: $output"
+            }
+          }
+
+          function Assert-Chinese([string]$output) {
+            if ($output -notmatch "[\u4e00-\u9fff]") {
+              throw "Chinese translation validation failed: $output"
+            }
+          }
+
+          function Get-Median([double[]]$values) {
+            $sorted = @($values | Sort-Object)
+            $n = $sorted.Count
+
+            if ($n -eq 0) {
+              throw "Cannot calculate median of empty set"
+            }
+
+            if (($n % 2) -eq 1) {
+              return [double]$sorted[[int][Math]::Floor($n / 2)]
+            }
+
+            $a = [double]$sorted[($n / 2) - 1]
+            $b = [double]$sorted[$n / 2]
+            return ($a + $b) / 2.0
+          }
+
+          $zhSource = "今天天气很好，我们下午去公园散步吧。"
+          $enSource = "Where are you? I will arrive at the station in ten minutes."
+
+          Write-Host "===== CLEAN RUNTIME FUNCTIONAL TEST ====="
+
+          $cleanWarm = Start-TestServer $cleanDir 19080 "clean-functional"
+
+          try {
+            $toEnglish = Invoke-TestTranslation `
+              $cleanWarm.Port `
+              "English" `
+              $zhSource
+
+            Assert-English $toEnglish.Output
+
+            $toChinese = Invoke-TestTranslation `
+              $cleanWarm.Port `
+              "Chinese" `
+              $enSource
+
+            Assert-Chinese $toChinese.Output
+
+            Write-Host "Chinese -> English:"
+            Write-Host $toEnglish.Output
+
+            Write-Host "English -> Chinese:"
+            Write-Host $toChinese.Output
+
+            $functionalEnglish = $toEnglish.Output
+            $functionalChinese = $toChinese.Output
+          } finally {
+            Stop-TestServer $cleanWarm
+          }
+
+          Write-Host "Clean runtime bidirectional functional validation PASS"
+
+          Write-Host "===== OFFICIAL BASELINE WARM PASS ====="
+
+          $officialWarm = Start-TestServer $officialDir 19081 "official-warm"
+
+          try {
+            $warmResult = Invoke-TestTranslation `
+              $officialWarm.Port `
+              "English" `
+              $zhSource
+
+            Assert-English $warmResult.Output
+          } finally {
+            Stop-TestServer $officialWarm
+          }
+
+          $officialStarts = [System.Collections.Generic.List[double]]::new()
+          $cleanStarts = [System.Collections.Generic.List[double]]::new()
+          $officialLatencies = [System.Collections.Generic.List[double]]::new()
+          $cleanLatencies = [System.Collections.Generic.List[double]]::new()
+
+          $port = 19100
+
+          for ($round = 1; $round -le 3; $round++) {
+            if (($round % 2) -eq 1) {
+              $kinds = @("official", "clean")
+            } else {
+              $kinds = @("clean", "official")
+            }
+
+            foreach ($kind in $kinds) {
+              if ($kind -eq "official") {
+                $dir = $officialDir
+              } else {
+                $dir = $cleanDir
+              }
+
+              Write-Host "===== BENCHMARK ROUND $round : $kind ====="
+
+              $server = Start-TestServer $dir $port "$kind-round-$round"
+              $port++
+
+              try {
+                if ($kind -eq "official") {
+                  $officialStarts.Add([double]$server.StartupMs)
+                } else {
+                  $cleanStarts.Add([double]$server.StartupMs)
+                }
+
+                $r1 = Invoke-TestTranslation `
+                  $server.Port `
+                  "English" `
+                  $zhSource
+
+                Assert-English $r1.Output
+
+                $r2 = Invoke-TestTranslation `
+                  $server.Port `
+                  "Chinese" `
+                  $enSource
+
+                Assert-Chinese $r2.Output
+
+                if ($kind -eq "official") {
+                  $officialLatencies.Add([double]$r1.LatencyMs)
+                  $officialLatencies.Add([double]$r2.LatencyMs)
+                } else {
+                  $cleanLatencies.Add([double]$r1.LatencyMs)
+                  $cleanLatencies.Add([double]$r2.LatencyMs)
+                }
+
+                Write-Host "Startup ms: $($server.StartupMs)"
+                Write-Host "Translation 1 ms: $($r1.LatencyMs)"
+                Write-Host "Translation 2 ms: $($r2.LatencyMs)"
+              } finally {
+                Stop-TestServer $server
+              }
+            }
+          }
+
+          $officialStartupMedian = Get-Median $officialStarts.ToArray()
+          $cleanStartupMedian = Get-Median $cleanStarts.ToArray()
+
+          $officialLatencyMedian = Get-Median $officialLatencies.ToArray()
+          $cleanLatencyMedian = Get-Median $cleanLatencies.ToArray()
+
+          if ($officialStartupMedian -le 0 -or $officialLatencyMedian -le 0) {
+            throw "Invalid official baseline timing"
+          }
+
+          $startupRatio = $cleanStartupMedian / $officialStartupMedian
+          $latencyRatio = $cleanLatencyMedian / $officialLatencyMedian
+
+          Write-Host "===== A-B RESULT ====="
+          Write-Host "Official startup median ms: $officialStartupMedian"
+          Write-Host "Clean startup median ms:    $cleanStartupMedian"
+          Write-Host "Clean / official startup:   $startupRatio"
+          Write-Host ""
+          Write-Host "Official translation median ms: $officialLatencyMedian"
+          Write-Host "Clean translation median ms:    $cleanLatencyMedian"
+          Write-Host "Clean / official translation:   $latencyRatio"
+
+          if ($startupRatio -gt 1.25) {
+            throw "STOP: clean runtime startup regression exceeds 25%"
+          }
+
+          if ($latencyRatio -gt 1.25) {
+            throw "STOP: clean runtime translation latency regression exceeds 25%"
+          }
+
+          $benchmark = @"
+          Nativa Windows Clean Runtime b10516 - A/B Validation
+
+          Model:
+          Tencent Hy-MT2-1.8B-Q4_K_M.gguf
+          Bytes: $env:MODEL_BYTES
+          SHA-256: $env:MODEL_SHA256
+
+          llama.cpp:
+          b10516
+          $env:EXPECTED_LLAMA_COMMIT
+
+          Threads:
+          $threads
+
+          Official startup samples ms:
+          $($officialStarts.ToArray() -join ", ")
+
+          Clean startup samples ms:
+          $($cleanStarts.ToArray() -join ", ")
+
+          Official startup median ms:
+          $officialStartupMedian
+
+          Clean startup median ms:
+          $cleanStartupMedian
+
+          Clean / official startup ratio:
+          $startupRatio
+
+          Official translation latency samples ms:
+          $($officialLatencies.ToArray() -join ", ")
+
+          Clean translation latency samples ms:
+          $($cleanLatencies.ToArray() -join ", ")
+
+          Official translation median ms:
+          $officialLatencyMedian
+
+          Clean translation median ms:
+          $cleanLatencyMedian
+
+          Clean / official translation latency ratio:
+          $latencyRatio
+
+          Acceptance threshold:
+          <= 1.25 for startup and translation latency
+
+          Functional Chinese -> English output:
+          $functionalEnglish
+
+          Functional English -> Chinese output:
+          $functionalChinese
+
+          Result:
+          PASS
+          "@
+
+          Set-Content `
+            -Path (Join-Path $cleanDir "BENCHMARK.txt") `
+            -Value $benchmark `
+            -Encoding utf8
+
+          Write-Host "Functional + A/B performance acceptance PASS"
+
+      - name: Build third-party licence and NOTICE bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:CLEAN_BIN_DIR
+          $legal = Join-Path $root "legal"
+          $licenses = Join-Path $legal "licenses"
+
+          New-Item -ItemType Directory -Force -Path $licenses | Out-Null
+
+          Copy-Item `
+            "llama.cpp/LICENSE" `
+            (Join-Path $licenses "llama.cpp-MIT.txt")
+
+          Copy-Item `
+            "llama.cpp/vendor/cpp-httplib/LICENSE" `
+            (Join-Path $licenses "cpp-httplib-MIT.txt")
+
+          Copy-Item `
+            "llama.cpp/vendor/hash/xxhash/LICENSE" `
+            (Join-Path $licenses "xxHash-LICENSE.txt")
+
+          Copy-Item `
+            "llama.cpp/vendor/hash/sha256/LICENSE" `
+            (Join-Path $licenses "sha256-LICENSE.txt")
+
+          Copy-Item `
+            "llama.cpp/vendor/hash/rotate-bits/LICENSE.md" `
+            (Join-Path $licenses "rotate-bits-LICENSE.md")
+
+          curl.exe `
+            -L `
+            --fail `
+            -o (Join-Path $licenses "nlohmann-json-MIT.txt") `
+            "https://raw.githubusercontent.com/nlohmann/json/v3.12.0/LICENSE.MIT"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not retrieve pinned nlohmann/json licence"
+          }
+
+          curl.exe `
+            -L `
+            --fail `
+            -o (Join-Path $licenses "miniaudio-LICENSE.txt") `
+            "https://raw.githubusercontent.com/mackron/miniaudio/9634bedb5b5a2ca38c1ee7108a9358a4e233f14d/LICENSE"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not retrieve pinned miniaudio licence"
+          }
+
+          curl.exe `
+            -L `
+            --fail `
+            -o (Join-Path $licenses "sheredom-subprocess-LICENSE.txt") `
+            "https://raw.githubusercontent.com/sheredom/subprocess.h/9ce0d701b6fb10f8f8c4445edd31e7c60a1237e3/LICENSE"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not retrieve pinned sheredom/subprocess licence"
+          }
+
+          $stbSource = Get-Content `
+            "llama.cpp/vendor/stb/stb_image.h" `
+            -Raw
+
+          $stbMarker = "This software is available under 2 licenses -- choose whichever you prefer."
+          $stbIndex = $stbSource.LastIndexOf($stbMarker)
+
+          if ($stbIndex -lt 0) {
+            throw "Could not locate stb_image licence block"
+          }
+
+          $stbLicence = $stbSource.Substring($stbIndex).Trim()
+
+          Set-Content `
+            -Path (Join-Path $licenses "stb_image-LICENSE.txt") `
+            -Value $stbLicence `
+            -Encoding utf8
+
+          $sha1Source = Get-Content `
+            "llama.cpp/vendor/hash/sha1/sha1.c" `
+            -Raw
+
+          $sha1Match = [regex]::Match(
+            $sha1Source,
+            "(?s)^/\*.*?\*/"
+          )
+
+          if (-not $sha1Match.Success) {
+            throw "Could not locate SHA-1 public-domain notice"
+          }
+
+          Set-Content `
+            -Path (Join-Path $licenses "sha1-PUBLIC-DOMAIN.txt") `
+            -Value $sha1Match.Value `
+            -Encoding utf8
+
+          $notices = @'
+          Nativa Local Translation Runtime
+          Third-Party Notices
+
+          This package contains or links code from the following third-party
+          components. Complete licence or public-domain notice text is included
+          under legal/licenses/.
+
+          1. llama.cpp / ggml
+             Upstream: ggml-org/llama.cpp
+             Version: b10516
+             Commit: b95502ba9aa0eb73a2f4fc8878d7fbe6a847a0b9
+             Licence: MIT
+             Licence file: llama.cpp-MIT.txt
+
+          2. cpp-httplib
+             Upstream: yhirose/cpp-httplib
+             Vendored by llama.cpp b10516
+             Version: v0.53.1
+             Licence: MIT
+             Licence file: cpp-httplib-MIT.txt
+
+          3. nlohmann/json
+             Version: 3.12.0
+             Licence: MIT
+             Licence file: nlohmann-json-MIT.txt
+
+          4. miniaudio
+             Upstream commit used by llama.cpp b10516:
+             9634bedb5b5a2ca38c1ee7108a9358a4e233f14d
+             Licence options: Public Domain or MIT No Attribution
+             Licence file: miniaudio-LICENSE.txt
+
+          5. stb_image
+             Vendored in llama.cpp b10516
+             Licence options: MIT or Public Domain
+             Licence file: stb_image-LICENSE.txt
+
+          6. sheredom/subprocess.h
+             Commit:
+             9ce0d701b6fb10f8f8c4445edd31e7c60a1237e3
+             Public-domain dedication
+             Licence file: sheredom-subprocess-LICENSE.txt
+
+          7. xxHash
+             Vendored by llama.cpp b10516
+             Licence text included from the frozen source tree.
+             Licence file: xxHash-LICENSE.txt
+
+          8. SHA-1 implementation by Steve Reid
+             Public Domain
+             Notice file: sha1-PUBLIC-DOMAIN.txt
+
+          9. sha256.c
+             Vendored by llama.cpp b10516
+             Licence text included from the frozen source tree.
+             Licence file: sha256-LICENSE.txt
+
+          10. rotate-bits.h
+              Vendored by llama.cpp b10516
+              Licence text included from the frozen source tree.
+              Licence file: rotate-bits-LICENSE.md
+
+          Microsoft Visual C++ runtime DLLs, if present in the package root,
+          are copied only from the formal Visual Studio VC\Redist\MSVC x64 CRT
+          directory discovered on the GitHub-hosted build runner. Files from
+          debug_nonredist are explicitly prohibited by this build.
+
+          No GGUF model is included in this runtime package.
+          '@
+
+          Set-Content `
+            -Path (Join-Path $legal "THIRD_PARTY_NOTICES.txt") `
+            -Value $notices `
+            -Encoding utf8
+
+          Write-Host "Third-party licence and NOTICE bundle ready"
+
+      - name: Generate provenance and SHA manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:CLEAN_BIN_DIR
+
+          $cmakeVersion = (cmake --version | Select-Object -First 1)
+          $gitVersion = (git --version)
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = (& $vswhere -latest -products * -property installationPath).Trim()
+
+          $toolRoot = Join-Path $vsInstall "VC\Tools\MSVC"
+          $toolDir = Get-ChildItem $toolRoot -Directory |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+          $cl = Join-Path $toolDir.FullName "bin\Hostx64\x64\cl.exe"
+          $compilerVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($cl).FileVersion
+
+          $runnerImage = if ($env:ImageOS) {
+            $env:ImageOS
+          } else {
+            "windows-2025"
+          }
+
+          $runnerImageVersion = if ($env:ImageVersion) {
+            $env:ImageVersion
+          } else {
+            "not exposed by runner environment"
+          }
+
+          $vcFiles = Get-Content (Join-Path $root "VC_REDIST_FILES.txt")
+
+          $source = @"
+          Nativa Windows Clean Local Runtime
+
+          Runtime:
+          llama.cpp b10516
+
+          Upstream:
+          https://github.com/ggml-org/llama.cpp
+
+          Upstream tag:
+          b10516
+
+          Upstream commit:
+          $env:EXPECTED_LLAMA_COMMIT
+
+          Platform:
+          Windows x64 CPU
+
+          Builder repository:
+          $env:GITHUB_REPOSITORY
+
+          Builder commit:
+          $env:GITHUB_SHA
+
+          GitHub Actions run:
+          $env:GITHUB_RUN_ID
+
+          Runner OS:
+          $env:RUNNER_OS
+
+          Runner architecture:
+          $env:RUNNER_ARCH
+
+          Runner image:
+          $runnerImage
+
+          Runner image version:
+          $runnerImageVersion
+
+          CMake:
+          $cmakeVersion
+
+          Git:
+          $gitVersion
+
+          MSVC tools:
+          $($toolDir.Name)
+
+          MSVC compiler file version:
+          $compilerVersion
+
+          Formal VC Redistributable source:
+          $env:VC_REDIST_SOURCE
+
+          Formal VC Redistributable files included:
+          $($vcFiles -join ", ")
+
+          Frozen CMake contract:
+          BUILD_SHARED_LIBS=ON
+          LLAMA_BUILD_COMMON=ON
+          LLAMA_BUILD_TESTS=OFF
+          LLAMA_BUILD_EXAMPLES=OFF
+          LLAMA_BUILD_TOOLS=ON
+          LLAMA_BUILD_SERVER=ON
+          LLAMA_BUILD_APP=OFF
+          LLAMA_BUILD_UI=OFF
+          LLAMA_USE_PREBUILT_UI=OFF
+          LLAMA_OPENSSL=OFF
+          LLAMA_BUILD_BORINGSSL=OFF
+          LLAMA_BUILD_LIBRESSL=OFF
+          LLAMA_LLGUIDANCE=OFF
+          GGML_OPENMP=OFF
+          GGML_NATIVE=OFF
+          GGML_BACKEND_DL=ON
+          GGML_CPU_ALL_VARIANTS=ON
+          GGML_RPC=OFF
+          GGML_CUDA=OFF
+          GGML_VULKAN=OFF
+          GGML_SYCL=OFF
+          GGML_BLAS=OFF
+          GGML_METAL=OFF
+          GGML_OPENCL=OFF
+
+          Model used only for validation:
+          Tencent Hy-MT2-1.8B-Q4_K_M.gguf
+
+          Model bytes:
+          $env:MODEL_BYTES
+
+          Model SHA-256:
+          $env:MODEL_SHA256
+
+          Model bundled in this runtime package:
+          NO
+
+          Official b10516 runtime used only as transient A/B baseline:
+          $env:OFFICIAL_RUNTIME_URL
+
+          Official baseline archive SHA-256:
+          $env:OFFICIAL_RUNTIME_SHA256
+
+          OpenMP:
+          OFF
+
+          OpenSSL:
+          OFF
+
+          BoringSSL:
+          OFF
+
+          LibreSSL:
+          OFF
+
+          CUDA:
+          OFF
+
+          Vulkan:
+          OFF
+
+          SYCL:
+          OFF
+
+          OpenCL:
+          OFF
+
+          Result:
+          Clean runtime build, PE dependency audit, exact-model functional
+          validation and A/B performance acceptance completed successfully.
+          "@
+
+          Set-Content `
+            -Path (Join-Path $root "SOURCE.txt") `
+            -Value $source `
+            -Encoding utf8
+
+          $modelValidation = @"
+          Validation model only - NOT bundled
+
+          Repository:
+          tencent/Hy-MT2-1.8B-GGUF
+
+          Artifact:
+          Hy-MT2-1.8B-Q4_K_M.gguf
+
+          Expected bytes:
+          $env:MODEL_BYTES
+
+          Expected SHA-256:
+          $env:MODEL_SHA256
+
+          Validation:
+          Chinese -> English PASS
+          English -> Chinese PASS
+
+          The model file is intentionally excluded from this runtime ZIP.
+          "@
+
+          Set-Content `
+            -Path (Join-Path $root "MODEL_VALIDATION.txt") `
+            -Value $modelValidation `
+            -Encoding utf8
+
+          if (Get-ChildItem $root -Recurse -Filter "*.gguf" -File) {
+            throw "STOP: model file entered final runtime package"
+          }
+
+          $manifestLines = @()
+
+          foreach ($file in Get-ChildItem $root -Recurse -File |
+            Where-Object { $_.Name -ne "MANIFEST.sha256" } |
+            Sort-Object FullName) {
+
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+            $relative = [System.IO.Path]::GetRelativePath(
+              $root,
+              $file.FullName
+            ).Replace("\", "/")
+
+            $manifestLines += "$hash  $relative"
+          }
+
+          Set-Content `
+            -Path (Join-Path $root "MANIFEST.sha256") `
+            -Value $manifestLines `
+            -Encoding utf8
+
+          Write-Host "===== FINAL FILE MANIFEST ====="
+          Get-Content (Join-Path $root "MANIFEST.sha256")
+
+      - name: Create final immutable clean runtime ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "artifact" | Out-Null
+
+          $zipPath = Join-Path (Resolve-Path "artifact") $env:FINAL_ZIP
+
+          Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+
+          Push-Location "dist-clean"
+
+          try {
+            Compress-Archive `
+              -Path $env:FINAL_ROOT `
+              -DestinationPath $zipPath `
+              -CompressionLevel Optimal
+          } finally {
+            Pop-Location
+          }
+
+          if (-not (Test-Path $zipPath)) {
+            throw "Final clean runtime ZIP was not created"
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+
+          try {
+            $badEntries = @(
+              $zip.Entries |
+              Where-Object {
+                -not $_.FullName.StartsWith(
+                  "$env:FINAL_ROOT/",
+                  [System.StringComparison]::Ordinal
+                )
+              }
+            )
+
+            if ($badEntries.Count -gt 0) {
+              throw "Final ZIP contains entries outside top-level $env:FINAL_ROOT/"
+            }
+
+            $ggufEntries = @(
+              $zip.Entries |
+              Where-Object {
+                $_.FullName -match "(?i)\.gguf$"
+              }
+            )
+
+            if ($ggufEntries.Count -gt 0) {
+              throw "STOP: final ZIP contains a GGUF model"
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+          $zipSize = (Get-Item $zipPath).Length
+          $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "===== FINAL CLEAN RUNTIME ====="
+          Write-Host "File:   $env:FINAL_ZIP"
+          Write-Host "Bytes:  $zipSize"
+          Write-Host "SHA256: $zipHash"
+
+          Set-Content `
+            -Path "$zipPath.sha256" `
+            -Value "$zipHash  $env:FINAL_ZIP" `
+            -Encoding ascii
+
+      - name: Upload final clean runtime v1
+        uses: actions/upload-artifact@v4
+        with:
+          name: nativa-llama-b10516-win-x64-clean-v1
+          path: |
+            artifact/nativa-llama-b10516-win-x64-clean-v1.zip
+            artifact/nativa-llama-b10516-win-x64-clean-v1.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
