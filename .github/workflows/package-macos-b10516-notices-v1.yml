@@ -1,0 +1,1418 @@
+name: Audit and package Nativa macOS b10516 notices v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      EXPECTED_LLAMA_COMMIT: b95502ba9aa0eb73a2f4fc8878d7fbe6a847a0b9
+
+      OFFICIAL_MAC_URL: "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz"
+      OFFICIAL_MAC_SHA256: ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30
+
+      BORINGSSL_VERSION: "0.20260813.0"
+
+      FINAL_ROOT: llama-mac-arm64-b10516
+      FINAL_ZIP: nativa-llama-b10516-macos-notices-v1.zip
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Fetch exact llama.cpp b10516
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin refs/tags/b10516
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+          actual="$(git -C llama.cpp rev-parse HEAD)"
+
+          echo "Expected commit: $EXPECTED_LLAMA_COMMIT"
+          echo "Actual commit:   $actual"
+
+          if [ "$actual" != "$EXPECTED_LLAMA_COMMIT" ]; then
+            echo "::error::b10516 resolved to unexpected commit $actual"
+            exit 1
+          fi
+
+          echo "Frozen llama.cpp b10516 commit PASS"
+
+      - name: Verify frozen macOS release build facts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p audit-export
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          root = Path("llama.cpp")
+          release = (root / ".github/workflows/release.yml").read_text(
+              encoding="utf-8"
+          )
+
+          if "  macos-cpu:" not in release:
+              raise SystemExit("macos-cpu section not found in exact b10516 release workflow")
+
+          tail = release.split("  macos-cpu:", 1)[1]
+
+          if "\n  ubuntu-cpu:" not in tail:
+              raise SystemExit("could not bound macos-cpu section")
+
+          mac = tail.split("\n  ubuntu-cpu:", 1)[0]
+
+          required = [
+              '-DLLAMA_BUILD_BORINGSSL=ON',
+              'cache-dependency-path: "tools/ui/package-lock.json"',
+              'cp LICENSE ./build/bin/',
+          ]
+
+          for item in required:
+              if item not in mac:
+                  raise SystemExit(
+                      f"required frozen macOS release fact missing: {item}"
+                  )
+
+          root_cmake = (root / "CMakeLists.txt").read_text(
+              encoding="utf-8"
+          )
+
+          if not re.search(
+              r'option\(LLAMA_BUILD_UI\s+"[^"]*"\s+ON\)',
+              root_cmake,
+          ):
+              raise SystemExit(
+                  "LLAMA_BUILD_UI=ON default not found in exact b10516"
+              )
+
+          evidence = f"""Nativa macOS b10516 release build evidence
+
+          llama.cpp tag:
+          b10516
+
+          llama.cpp expected commit:
+          {os.environ["EXPECTED_LLAMA_COMMIT"]}
+
+          Official macOS release workflow facts:
+          - macos-cpu exists
+          - LLAMA_BUILD_BORINGSSL=ON
+          - Node/npm cache authority is tools/ui/package-lock.json
+          - upstream LICENSE is copied into build/bin before packaging
+          - LLAMA_BUILD_UI defaults ON
+
+          Result:
+          PASS
+          """
+
+          Path("audit-export/BUILD_EVIDENCE.txt").write_text(
+              evidence,
+              encoding="utf-8",
+          )
+
+          print("Frozen macOS release build facts PASS")
+          PY
+
+          if ! grep -Fq 'set(BORINGSSL_VERSION "0.20260813.0"' \
+            llama.cpp/vendor/cpp-httplib/CMakeLists.txt; then
+            echo "::error::Expected BoringSSL version not found in exact b10516"
+            exit 1
+          fi
+
+          echo "Frozen BoringSSL version declaration PASS"
+
+      - name: Download and verify official macOS arm64 runtime archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p official-mac
+
+          archive="official-mac/llama-b10516-bin-macos-arm64.tar.gz"
+
+          curl \
+            --location \
+            --fail \
+            --retry 3 \
+            --retry-delay 5 \
+            --output "$archive" \
+            "$OFFICIAL_MAC_URL"
+
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+
+          echo "Expected archive SHA-256: $OFFICIAL_MAC_SHA256"
+          echo "Actual archive SHA-256:   $actual"
+
+          if [ "$actual" != "$OFFICIAL_MAC_SHA256" ]; then
+            echo "::error::Official macOS b10516 archive SHA-256 mismatch"
+            exit 1
+          fi
+
+          tar -tzf "$archive" > audit-export/OFFICIAL_MAC_ARCHIVE_CONTENTS.txt
+
+          license_entry="$(
+            grep -E '(^|/)LICENSE$' \
+              audit-export/OFFICIAL_MAC_ARCHIVE_CONTENTS.txt \
+              | head -n 1 || true
+          )"
+
+          if [ -z "$license_entry" ]; then
+            echo "::error::Official Mac archive does not contain upstream LICENSE"
+            exit 1
+          fi
+
+          server_entry="$(
+            grep -E '(^|/)llama-server$' \
+              audit-export/OFFICIAL_MAC_ARCHIVE_CONTENTS.txt \
+              | head -n 1 || true
+          )"
+
+          if [ -z "$server_entry" ]; then
+            echo "::error::Official Mac archive does not contain llama-server"
+            exit 1
+          fi
+
+          tar -xOf "$archive" "$license_entry" \
+            > official-mac/LICENSE-from-runtime
+
+          if ! cmp -s \
+            llama.cpp/LICENSE \
+            official-mac/LICENSE-from-runtime; then
+            echo "::error::Runtime archive LICENSE does not match exact b10516 source LICENSE"
+            exit 1
+          fi
+
+          echo "Official macOS arm64 archive identity PASS"
+          echo "Official runtime LICENSE/source match PASS"
+
+      - name: Fetch exact BoringSSL licence source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git init boringssl
+          git -C boringssl remote add origin \
+            https://boringssl.googlesource.com/boringssl
+
+          git -C boringssl fetch \
+            --depth 1 \
+            origin \
+            "refs/tags/${BORINGSSL_VERSION}"
+
+          git -C boringssl checkout --detach FETCH_HEAD
+
+          boring_commit="$(git -C boringssl rev-parse HEAD)"
+
+          if [ ! -f boringssl/LICENSE ]; then
+            echo "::error::BoringSSL LICENSE not found at frozen version"
+            exit 1
+          fi
+
+          echo "BoringSSL version: $BORINGSSL_VERSION"
+          echo "BoringSSL commit:  $boring_commit"
+
+          echo "BORINGSSL_COMMIT=$boring_commit" >> "$GITHUB_ENV"
+
+      - name: Build frozen C and C++ licence inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          legal="dist/$FINAL_ROOT/legal"
+          licenses="$legal/licenses"
+
+          rm -rf dist
+          mkdir -p "$licenses"
+
+          cp \
+            llama.cpp/LICENSE \
+            "$licenses/llama.cpp-MIT.txt"
+
+          cp \
+            llama.cpp/vendor/cpp-httplib/LICENSE \
+            "$licenses/cpp-httplib-MIT.txt"
+
+          cp \
+            llama.cpp/vendor/hash/xxhash/LICENSE \
+            "$licenses/xxHash-LICENSE.txt"
+
+          cp \
+            llama.cpp/vendor/hash/sha256/LICENSE \
+            "$licenses/sha256-LICENSE.txt"
+
+          cp \
+            llama.cpp/vendor/hash/rotate-bits/LICENSE.md \
+            "$licenses/rotate-bits-LICENSE.md"
+
+          cp \
+            boringssl/LICENSE \
+            "$licenses/BoringSSL-LICENSE.txt"
+
+          if ! grep -Fq \
+            "9634bedb5b5a2ca38c1ee7108a9358a4e233f14d" \
+            llama.cpp/scripts/sync_vendor.py; then
+            echo "::error::Frozen miniaudio commit missing from exact b10516"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "9ce0d701b6fb10f8f8c4445edd31e7c60a1237e3" \
+            llama.cpp/scripts/sync_vendor.py; then
+            echo "::error::Frozen sheredom/subprocess commit missing from exact b10516"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "v0.53.1" \
+            llama.cpp/scripts/sync_vendor.py; then
+            echo "::error::Frozen cpp-httplib version missing from exact b10516"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "#define NLOHMANN_JSON_VERSION_MAJOR 3" \
+            llama.cpp/vendor/nlohmann/json.hpp; then
+            echo "::error::nlohmann/json major version evidence missing"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "#define NLOHMANN_JSON_VERSION_MINOR 12" \
+            llama.cpp/vendor/nlohmann/json.hpp; then
+            echo "::error::nlohmann/json minor version evidence missing"
+            exit 1
+          fi
+
+          if ! grep -Fq \
+            "#define NLOHMANN_JSON_VERSION_PATCH 0" \
+            llama.cpp/vendor/nlohmann/json.hpp; then
+            echo "::error::nlohmann/json patch version evidence missing"
+            exit 1
+          fi
+
+          curl \
+            --location \
+            --fail \
+            --retry 3 \
+            --output "$licenses/nlohmann-json-MIT.txt" \
+            "https://raw.githubusercontent.com/nlohmann/json/v3.12.0/LICENSE.MIT"
+
+          curl \
+            --location \
+            --fail \
+            --retry 3 \
+            --output "$licenses/miniaudio-LICENSE.txt" \
+            "https://raw.githubusercontent.com/mackron/miniaudio/9634bedb5b5a2ca38c1ee7108a9358a4e233f14d/LICENSE"
+
+          curl \
+            --location \
+            --fail \
+            --retry 3 \
+            --output "$licenses/sheredom-subprocess-LICENSE.txt" \
+            "https://raw.githubusercontent.com/sheredom/subprocess.h/9ce0d701b6fb10f8f8c4445edd31e7c60a1237e3/LICENSE"
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = Path("llama.cpp")
+          licenses = Path("dist") / "llama-mac-arm64-b10516" / "legal" / "licenses"
+
+          stb = (
+              root / "vendor/stb/stb_image.h"
+          ).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+
+          marker = (
+              "This software is available under 2 licenses -- "
+              "choose whichever you prefer."
+          )
+
+          idx = stb.rfind(marker)
+
+          if idx < 0:
+              raise SystemExit("Could not locate stb_image licence block")
+
+          (licenses / "stb_image-LICENSE.txt").write_text(
+              stb[idx:].strip() + "\n",
+              encoding="utf-8",
+          )
+
+          sha1 = (
+              root / "vendor/hash/sha1/sha1.c"
+          ).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+
+          if not sha1.startswith("/*"):
+              raise SystemExit("SHA-1 source does not start with expected notice")
+
+          end = sha1.find("*/")
+
+          if end < 0:
+              raise SystemExit("Could not locate SHA-1 notice terminator")
+
+          (licenses / "sha1-PUBLIC-DOMAIN.txt").write_text(
+              sha1[: end + 2].strip() + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          cat > "$legal/CPP_COMPONENT_INVENTORY.txt" <<EOF
+          Nativa macOS b10516 C/C++ licence inventory
+
+          1. llama.cpp / ggml
+             Version: b10516
+             Commit: $EXPECTED_LLAMA_COMMIT
+             Licence file: licenses/llama.cpp-MIT.txt
+
+          2. cpp-httplib
+             Version: v0.53.1
+             Licence file: licenses/cpp-httplib-MIT.txt
+
+          3. nlohmann/json
+             Version: 3.12.0
+             Licence file: licenses/nlohmann-json-MIT.txt
+
+          4. BoringSSL
+             Version: $BORINGSSL_VERSION
+             Commit: $BORINGSSL_COMMIT
+             Licence file: licenses/BoringSSL-LICENSE.txt
+
+          5. miniaudio
+             Commit: 9634bedb5b5a2ca38c1ee7108a9358a4e233f14d
+             Licence file: licenses/miniaudio-LICENSE.txt
+
+          6. stb_image
+             Vendored by exact llama.cpp b10516
+             Licence file: licenses/stb_image-LICENSE.txt
+
+          7. sheredom/subprocess.h
+             Commit: 9ce0d701b6fb10f8f8c4445edd31e7c60a1237e3
+             Licence file: licenses/sheredom-subprocess-LICENSE.txt
+
+          8. xxHash
+             Vendored by exact llama.cpp b10516
+             Licence file: licenses/xxHash-LICENSE.txt
+
+          9. SHA-1 implementation
+             Vendored by exact llama.cpp b10516
+             Notice file: licenses/sha1-PUBLIC-DOMAIN.txt
+
+          10. sha256.c
+              Vendored by exact llama.cpp b10516
+              Licence file: licenses/sha256-LICENSE.txt
+
+          11. rotate-bits.h
+              Vendored by exact llama.cpp b10516
+              Licence file: licenses/rotate-bits-LICENSE.md
+
+          System Apple frameworks are not redistributed by this package.
+          No model bytes are included in this legal bundle.
+          EOF
+
+          echo "Frozen C/C++ licence inventory ready"
+
+      - name: Install exact embedded UI dependency tree without lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ui="llama.cpp/tools/ui"
+
+          if [ ! -f "$ui/package-lock.json" ]; then
+            echo "::error::Exact b10516 UI package-lock.json missing"
+            exit 1
+          fi
+
+          lock_sha="$(sha256sum "$ui/package-lock.json" | awk '{print $1}')"
+
+          echo "Exact b10516 UI package-lock SHA-256:"
+          echo "$lock_sha"
+
+          echo "UI_LOCK_SHA256=$lock_sha" >> "$GITHUB_ENV"
+
+          (
+            cd "$ui"
+            npm ci \
+              --ignore-scripts \
+              --no-audit \
+              --no-fund
+          )
+
+          echo "Exact UI dependency tree installed with lifecycle scripts disabled"
+
+      - name: Build embedded UI npm licence inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          legal="dist/$FINAL_ROOT/legal"
+          mkdir -p "$legal/licenses/npm"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+
+          const uiRoot = path.resolve("llama.cpp/tools/ui");
+          const lockPath = path.join(uiRoot, "package-lock.json");
+
+          const legalRoot = path.resolve(
+            "dist",
+            "llama-mac-arm64-b10516",
+            "legal"
+          );
+
+          const npmLicenseRoot = path.join(
+            legalRoot,
+            "licenses",
+            "npm"
+          );
+
+          fs.mkdirSync(npmLicenseRoot, { recursive: true });
+
+          const lock = JSON.parse(
+            fs.readFileSync(lockPath, "utf8")
+          );
+
+          if (!lock.packages || typeof lock.packages !== "object") {
+            throw new Error(
+              "package-lock.json does not contain a packages object"
+            );
+          }
+
+          const sha256 = (buf) =>
+            crypto.createHash("sha256").update(buf).digest("hex");
+
+          const safeName = (value) =>
+            value
+              .replace(/^@/, "")
+              .replace(/[\/\\:@\s]+/g, "__")
+              .replace(/[^A-Za-z0-9._+-]/g, "_");
+
+          const licenseNamePattern =
+            /^(licen[sc]e|copying|notice|unlicense)([._-].*)?$/i;
+
+          const reviewPattern =
+            /\b(AGPL|GPL|LGPL|SSPL|BUSL|BSL-1\.1|Commons Clause|NonCommercial|NON-COMMERCIAL)\b/i;
+
+          const entries = [];
+          const unresolved = [];
+          const seen = new Set();
+
+          let lockPackageEntries = 0;
+          let installedUniquePackages = 0;
+
+          for (const [lockKey, lockEntry] of Object.entries(lock.packages)) {
+            if (!lockKey || !lockKey.includes("node_modules/")) {
+              continue;
+            }
+
+            lockPackageEntries++;
+
+            const abs = path.join(uiRoot, lockKey);
+
+            if (!fs.existsSync(abs)) {
+              continue;
+            }
+
+            const pkgJsonPath = path.join(abs, "package.json");
+
+            if (!fs.existsSync(pkgJsonPath)) {
+              continue;
+            }
+
+            let pkg;
+
+            try {
+              pkg = JSON.parse(
+                fs.readFileSync(pkgJsonPath, "utf8")
+              );
+            } catch (err) {
+              unresolved.push({
+                lockKey,
+                problem: "package.json could not be parsed",
+                detail: String(err),
+              });
+              continue;
+            }
+
+            const name =
+              typeof pkg.name === "string" && pkg.name
+                ? pkg.name
+                : lockEntry.name || lockKey;
+
+            const version =
+              typeof pkg.version === "string" && pkg.version
+                ? pkg.version
+                : lockEntry.version || "UNKNOWN";
+
+            const dedupeKey = `${name}@${version}`;
+
+            if (seen.has(dedupeKey)) {
+              continue;
+            }
+
+            seen.add(dedupeKey);
+            installedUniquePackages++;
+
+            let declaredLicense = "";
+
+            if (typeof pkg.license === "string") {
+              declaredLicense = pkg.license.trim();
+            } else if (
+              pkg.license &&
+              typeof pkg.license.type === "string"
+            ) {
+              declaredLicense = pkg.license.type.trim();
+            } else if (Array.isArray(pkg.licenses)) {
+              declaredLicense = pkg.licenses
+                .map((x) =>
+                  typeof x === "string"
+                    ? x
+                    : x && typeof x.type === "string"
+                      ? x.type
+                      : ""
+                )
+                .filter(Boolean)
+                .join(" OR ");
+            } else if (typeof lockEntry.license === "string") {
+              declaredLicense = lockEntry.license.trim();
+            }
+
+            const topNames = fs.readdirSync(abs);
+
+            const sourceLicenseFiles = topNames
+              .filter((name) => licenseNamePattern.test(name))
+              .sort((a, b) => a.localeCompare(b));
+
+            const packageDir = path.join(
+              npmLicenseRoot,
+              safeName(`${name}@${version}`)
+            );
+
+            fs.mkdirSync(packageDir, { recursive: true });
+
+            const copiedLicenses = [];
+
+            for (let i = 0; i < sourceLicenseFiles.length; i++) {
+              const sourceName = sourceLicenseFiles[i];
+              const sourcePath = path.join(abs, sourceName);
+
+              let stat;
+
+              try {
+                stat = fs.statSync(sourcePath);
+              } catch {
+                continue;
+              }
+
+              if (!stat.isFile()) {
+                continue;
+              }
+
+              const data = fs.readFileSync(sourcePath);
+
+              const targetName =
+                `${String(i + 1).padStart(2, "0")}-` +
+                safeName(sourceName) +
+                ".txt";
+
+              const targetPath = path.join(
+                packageDir,
+                targetName
+              );
+
+              fs.writeFileSync(targetPath, data);
+
+              copiedLicenses.push({
+                sourceName,
+                bundledPath: path
+                  .relative(legalRoot, targetPath)
+                  .split(path.sep)
+                  .join("/"),
+                sha256: sha256(data),
+                bytes: data.length,
+              });
+            }
+
+            const item = {
+              name,
+              version,
+              declaredLicense:
+                declaredLicense || "UNKNOWN",
+              lockKey,
+              integrity:
+                typeof lockEntry.integrity === "string"
+                  ? lockEntry.integrity
+                  : null,
+              resolved:
+                typeof lockEntry.resolved === "string"
+                  ? lockEntry.resolved
+                  : null,
+              licenseFiles: copiedLicenses,
+            };
+
+            entries.push(item);
+
+            if (!declaredLicense) {
+              unresolved.push({
+                package: dedupeKey,
+                problem: "missing declared licence metadata",
+              });
+            }
+
+            if (copiedLicenses.length === 0) {
+              unresolved.push({
+                package: dedupeKey,
+                problem: "no top-level licence/notice text found in installed package",
+                declaredLicense:
+                  declaredLicense || "UNKNOWN",
+              });
+            }
+
+            if (
+              declaredLicense &&
+              (
+                reviewPattern.test(declaredLicense) ||
+                /SEE LICENSE IN/i.test(declaredLicense) ||
+                /UNLICENSED/i.test(declaredLicense) ||
+                /UNKNOWN/i.test(declaredLicense)
+              )
+            ) {
+              unresolved.push({
+                package: dedupeKey,
+                problem: "licence requires manual review",
+                declaredLicense,
+              });
+            }
+          }
+
+          entries.sort((a, b) =>
+            `${a.name}@${a.version}`.localeCompare(
+              `${b.name}@${b.version}`
+            )
+          );
+
+          unresolved.sort((a, b) =>
+            JSON.stringify(a).localeCompare(
+              JSON.stringify(b)
+            )
+          );
+
+          const inventory = {
+            authority:
+              "ggml-org/llama.cpp exact b10516 tools/ui/package-lock.json",
+            packageLockVersion:
+              lock.lockfileVersion ?? null,
+            lockPackageEntries,
+            installedUniquePackages,
+            note:
+              "Inventory is intentionally conservative and includes the exact installed UI build dependency tree. Build-only notices may therefore be over-inclusive.",
+            packages: entries,
+          };
+
+          fs.writeFileSync(
+            path.join(
+              legalRoot,
+              "UI_NPM_INVENTORY.json"
+            ),
+            JSON.stringify(inventory, null, 2) + "\n",
+            "utf8"
+          );
+
+          const unresolvedText = unresolved.length
+            ? [
+                "REVIEW REQUIRED",
+                "",
+                `Unresolved findings: ${unresolved.length}`,
+                "",
+                ...unresolved.map(
+                  (item, index) =>
+                    `${index + 1}. ${JSON.stringify(item)}`
+                ),
+                "",
+              ].join("\n")
+            : "NONE\n";
+
+          fs.writeFileSync(
+            path.join(
+              legalRoot,
+              "UNRESOLVED.txt"
+            ),
+            unresolvedText,
+            "utf8"
+          );
+
+          fs.writeFileSync(
+            path.join(
+              legalRoot,
+              "UNRESOLVED_COUNT.txt"
+            ),
+            String(unresolved.length) + "\n",
+            "utf8"
+          );
+
+          console.log(
+            `UI packages inventoried: ${entries.length}`
+          );
+
+          console.log(
+            `Unresolved findings: ${unresolved.length}`
+          );
+          NODE
+
+      - name: Preserve frozen UI lockfile authority
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          legal="dist/$FINAL_ROOT/legal"
+
+          mkdir -p "$legal/source"
+
+          cp \
+            llama.cpp/tools/ui/package-lock.json \
+            "$legal/source/tools-ui-package-lock.json"
+
+          echo "Frozen UI package-lock copied into legal bundle"
+
+      - name: Generate legal provenance and third-party notices
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          legal="dist/$FINAL_ROOT/legal"
+
+          cat > "$legal/LEGAL_SOURCE.txt" <<EOF
+          Nativa macOS Local Runtime Legal Bundle
+
+          Platform:
+          macOS Apple Silicon arm64
+
+          Runtime:
+          llama.cpp b10516
+
+          Upstream repository:
+          https://github.com/ggml-org/llama.cpp
+
+          Upstream tag:
+          b10516
+
+          Upstream commit:
+          $EXPECTED_LLAMA_COMMIT
+
+          Official runtime archive:
+          llama-b10516-bin-macos-arm64.tar.gz
+
+          Official runtime URL:
+          $OFFICIAL_MAC_URL
+
+          Official runtime SHA-256:
+          $OFFICIAL_MAC_SHA256
+
+          BoringSSL version:
+          $BORINGSSL_VERSION
+
+          BoringSSL commit resolved from frozen tag:
+          $BORINGSSL_COMMIT
+
+          Embedded UI source:
+          tools/ui from exact llama.cpp b10516
+
+          UI dependency authority:
+          tools/ui/package-lock.json from exact llama.cpp b10516
+
+          UI package-lock SHA-256:
+          $UI_LOCK_SHA256
+
+          Runtime binaries included in this legal bundle:
+          NO
+
+          Model included in this legal bundle:
+          NO
+
+          Hy-MT2 model bytes included:
+          NO
+
+          Builder repository:
+          $GITHUB_REPOSITORY
+
+          Builder commit:
+          $GITHUB_SHA
+
+          GitHub Actions run:
+          $GITHUB_RUN_ID
+          EOF
+
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          legal = (
+              Path("dist")
+              / "llama-mac-arm64-b10516"
+              / "legal"
+          )
+
+          inventory = json.loads(
+              (legal / "UI_NPM_INVENTORY.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          unresolved_count = int(
+              (legal / "UNRESOLVED_COUNT.txt")
+              .read_text(encoding="utf-8")
+              .strip()
+          )
+
+          status = (
+              "PASS CANDIDATE - ZERO AUTOMATED UNRESOLVED FINDINGS"
+              if unresolved_count == 0
+              else "PROVISIONAL - MANUAL REVIEW REQUIRED"
+          )
+
+          lines = [
+              "Nativa macOS Local Translation Runtime",
+              "Third-Party Notices",
+              "",
+              f"Automated audit status: {status}",
+              "",
+              "This legal bundle contains no executable runtime binaries",
+              "and no GGUF model bytes.",
+              "",
+              "C/C++ components",
+              "================",
+              "",
+              "Complete licence or notice text for the frozen C/C++",
+              "components is included under legal/licenses/.",
+              "",
+              "See:",
+              "CPP_COMPONENT_INVENTORY.txt",
+              "",
+              "Embedded llama-server Web UI",
+              "============================",
+              "",
+              "The official llama.cpp b10516 macOS release builds",
+              "llama-server with the embedded llama-ui enabled.",
+              "",
+              "The following npm inventory is derived from the exact",
+              "b10516 tools/ui/package-lock.json and an npm ci run",
+              "with lifecycle scripts disabled.",
+              "",
+              "The inventory is intentionally conservative and may",
+              "include build-time packages whose notices are not",
+              "strictly required in the final binary.",
+              "",
+              f"Unique installed packages inventoried: "
+              f"{inventory['installedUniquePackages']}",
+              "",
+          ]
+
+          for item in inventory["packages"]:
+              lines.append(
+                  f"- {item['name']}@{item['version']} "
+                  f"— declared licence: "
+                  f"{item['declaredLicense']}"
+              )
+
+              for lic in item["licenseFiles"]:
+                  lines.append(
+                      f"  licence text: {lic['bundledPath']}"
+                  )
+
+          lines += [
+              "",
+              "Automated unresolved findings",
+              "=============================",
+              "",
+              f"Count: {unresolved_count}",
+              "",
+              "See UNRESOLVED.txt for details.",
+              "",
+              "No automated licence classification in this workflow",
+              "is a substitute for final manual legal/compliance review.",
+              "",
+          ]
+
+          (legal / "THIRD_PARTY_NOTICES.txt").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+          PY
+
+          echo "Legal provenance and third-party notices generated"
+
+      - name: Generate legal SHA-256 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          legal = (
+              Path("dist")
+              / "llama-mac-arm64-b10516"
+              / "legal"
+          )
+
+          manifest = legal / "LEGAL_MANIFEST.sha256"
+
+          rows = []
+
+          for file in sorted(
+              p for p in legal.rglob("*")
+              if p.is_file()
+              and p.name != "LEGAL_MANIFEST.sha256"
+          ):
+              data = file.read_bytes()
+
+              digest = hashlib.sha256(data).hexdigest()
+
+              rel = file.relative_to(legal).as_posix()
+
+              rows.append(f"{digest}  {rel}")
+
+          if not rows:
+              raise SystemExit(
+                  "legal bundle contains no files"
+              )
+
+          manifest.write_text(
+              "\n".join(rows) + "\n",
+              encoding="utf-8",
+          )
+
+          print(
+              f"LEGAL_MANIFEST.sha256 generated: "
+              f"{len(rows)} files"
+          )
+          PY
+
+      - name: Re-verify complete legal manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import hashlib
+          import re
+
+          legal = (
+              Path("dist")
+              / "llama-mac-arm64-b10516"
+              / "legal"
+          )
+
+          manifest = legal / "LEGAL_MANIFEST.sha256"
+
+          seen = set()
+          checked = 0
+
+          for raw in manifest.read_text(
+              encoding="utf-8"
+          ).splitlines():
+              if not raw.strip():
+                  continue
+
+              match = re.fullmatch(
+                  r"([0-9a-f]{64})  (.+)",
+                  raw
+              )
+
+              if not match:
+                  raise SystemExit(
+                      f"Malformed manifest line: {raw}"
+                  )
+
+              expected, rel = match.groups()
+
+              if rel in seen:
+                  raise SystemExit(
+                      f"Duplicate manifest entry: {rel}"
+                  )
+
+              seen.add(rel)
+
+              target = legal / rel
+
+              if not target.is_file():
+                  raise SystemExit(
+                      f"Manifest file missing: {rel}"
+                  )
+
+              actual = hashlib.sha256(
+                  target.read_bytes()
+              ).hexdigest()
+
+              if actual != expected:
+                  raise SystemExit(
+                      f"Manifest mismatch: {rel}"
+                  )
+
+              checked += 1
+
+          actual_files = {
+              p.relative_to(legal).as_posix()
+              for p in legal.rglob("*")
+              if p.is_file()
+              and p.name != "LEGAL_MANIFEST.sha256"
+          }
+
+          if actual_files != seen:
+              missing = sorted(actual_files - seen)
+              extra = sorted(seen - actual_files)
+
+              raise SystemExit(
+                  f"Manifest coverage mismatch. "
+                  f"Unlisted={missing} missing={extra}"
+              )
+
+          print(
+              f"Legal manifest PASS: {checked} files verified"
+          )
+          PY
+
+      - name: Safety audit legal-only payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          root = (
+              Path("dist")
+              / "llama-mac-arm64-b10516"
+          )
+
+          legal = root / "legal"
+
+          forbidden_suffixes = {
+              ".dylib",
+              ".so",
+              ".dll",
+              ".exe",
+              ".gguf",
+              ".app",
+              ".bin",
+              ".a",
+              ".o",
+              ".obj",
+          }
+
+          forbidden_magics = [
+              b"\x7fELF",
+              b"MZ",
+              bytes.fromhex("feedface"),
+              bytes.fromhex("cefaedfe"),
+              bytes.fromhex("feedfacf"),
+              bytes.fromhex("cffaedfe"),
+              bytes.fromhex("cafebabe"),
+              bytes.fromhex("bebafeca"),
+          ]
+
+          all_files = [
+              p for p in root.rglob("*")
+              if p.is_file()
+          ]
+
+          if not all_files:
+              raise SystemExit(
+                  "No legal files produced"
+              )
+
+          for file in all_files:
+              try:
+                  file.relative_to(legal)
+              except ValueError:
+                  raise SystemExit(
+                      f"Non-legal payload found: {file}"
+                  )
+
+              if file.suffix.lower() in forbidden_suffixes:
+                  raise SystemExit(
+                      f"Forbidden binary/model suffix: {file}"
+                  )
+
+              head = file.read_bytes()[:4]
+
+              if any(
+                  head.startswith(magic)
+                  for magic in forbidden_magics
+              ):
+                  raise SystemExit(
+                      f"Binary magic detected in legal bundle: {file}"
+                  )
+
+          print(
+              f"Legal-only payload PASS: "
+              f"{len(all_files)} files"
+          )
+          PY
+
+      - name: Build deterministic legal notice ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import zipfile
+
+          final_root = os.environ["FINAL_ROOT"]
+          final_zip = os.environ["FINAL_ZIP"]
+
+          source = Path("dist") / final_root
+
+          if not source.is_dir():
+              raise SystemExit(
+                  f"source root missing: {source}"
+              )
+
+          out = Path(final_zip)
+
+          if out.exists():
+              out.unlink()
+
+          files = sorted(
+              p for p in source.rglob("*")
+              if p.is_file()
+          )
+
+          with zipfile.ZipFile(
+              out,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+          ) as zf:
+              for file in files:
+                  rel = file.relative_to(source).as_posix()
+
+                  arcname = (
+                      f"{final_root}/{rel}"
+                  )
+
+                  info = zipfile.ZipInfo(
+                      arcname,
+                      date_time=(1980, 1, 1, 0, 0, 0),
+                  )
+
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  info.create_system = 3
+
+                  zf.writestr(
+                      info,
+                      file.read_bytes(),
+                      compress_type=zipfile.ZIP_DEFLATED,
+                      compresslevel=9,
+                  )
+
+          print(
+              f"Deterministic ZIP ready: {out}"
+          )
+          PY
+
+          zip_sha="$(sha256sum "$FINAL_ZIP" | awk '{print $1}')"
+          zip_bytes="$(stat -c '%s' "$FINAL_ZIP")"
+
+          printf '%s  %s\n' \
+            "$zip_sha" \
+            "$FINAL_ZIP" \
+            > "$FINAL_ZIP.sha256"
+
+          echo "FINAL_ZIP_NAME=$FINAL_ZIP"
+          echo "FINAL_ZIP_BYTES=$zip_bytes"
+          echo "FINAL_ZIP_SHA256=$zip_sha"
+
+      - name: Independently inspect final ZIP payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import zipfile
+
+          final_root = os.environ["FINAL_ROOT"]
+          final_zip = os.environ["FINAL_ZIP"]
+
+          prefix = f"{final_root}/legal/"
+
+          forbidden = (
+              ".dylib",
+              ".so",
+              ".dll",
+              ".exe",
+              ".gguf",
+              ".app",
+              ".bin",
+              ".a",
+              ".o",
+              ".obj",
+          )
+
+          with zipfile.ZipFile(final_zip, "r") as zf:
+              names = zf.namelist()
+
+              if not names:
+                  raise SystemExit(
+                      "Final ZIP is empty"
+                  )
+
+              if len(names) != len(set(names)):
+                  raise SystemExit(
+                      "Duplicate ZIP entries found"
+                  )
+
+              for name in names:
+                  if "\\" in name:
+                      raise SystemExit(
+                          f"Backslash ZIP path rejected: {name}"
+                      )
+
+                  if name.startswith("/"):
+                      raise SystemExit(
+                          f"Absolute ZIP path rejected: {name}"
+                      )
+
+                  parts = name.split("/")
+
+                  if ".." in parts or "." in parts:
+                      raise SystemExit(
+                          f"Unsafe ZIP path rejected: {name}"
+                      )
+
+                  if not name.startswith(prefix):
+                      raise SystemExit(
+                          f"Payload outside legal prefix: {name}"
+                      )
+
+                  lower = name.lower()
+
+                  if lower.endswith(forbidden):
+                      raise SystemExit(
+                          f"Forbidden binary/model in ZIP: {name}"
+                      )
+
+              required = {
+                  f"{prefix}LEGAL_SOURCE.txt",
+                  f"{prefix}LEGAL_MANIFEST.sha256",
+                  f"{prefix}THIRD_PARTY_NOTICES.txt",
+                  f"{prefix}CPP_COMPONENT_INVENTORY.txt",
+                  f"{prefix}UI_NPM_INVENTORY.json",
+                  f"{prefix}UNRESOLVED.txt",
+              }
+
+              missing = sorted(
+                  required - set(names)
+              )
+
+              if missing:
+                  raise SystemExit(
+                      f"Required legal files missing: {missing}"
+                  )
+
+          print(
+              f"Final ZIP safety audit PASS: "
+              f"{len(names)} files"
+          )
+          PY
+
+      - name: Export audit reports
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p audit-export
+
+          legal="dist/$FINAL_ROOT/legal"
+
+          for name in \
+            LEGAL_SOURCE.txt \
+            LEGAL_MANIFEST.sha256 \
+            THIRD_PARTY_NOTICES.txt \
+            CPP_COMPONENT_INVENTORY.txt \
+            UI_NPM_INVENTORY.json \
+            UNRESOLVED.txt \
+            UNRESOLVED_COUNT.txt
+          do
+            if [ -f "$legal/$name" ]; then
+              cp "$legal/$name" "audit-export/$name"
+            fi
+          done
+
+          if [ -f "$FINAL_ZIP.sha256" ]; then
+            cp "$FINAL_ZIP.sha256" audit-export/
+          fi
+
+      - name: Upload macOS notice audit artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: nativa-llama-b10516-macos-notices-v1-audit
+          path: |
+            nativa-llama-b10516-macos-notices-v1.zip
+            nativa-llama-b10516-macos-notices-v1.zip.sha256
+            audit-export/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Final automated licence gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          count_file="dist/$FINAL_ROOT/legal/UNRESOLVED_COUNT.txt"
+
+          if [ ! -f "$count_file" ]; then
+            echo "::error::UNRESOLVED_COUNT.txt missing"
+            exit 1
+          fi
+
+          count="$(tr -d '[:space:]' < "$count_file")"
+
+          if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid unresolved count: $count"
+            exit 1
+          fi
+
+          if [ "$count" -ne 0 ]; then
+            echo "::error::macOS NOTICE audit found $count item(s) requiring manual review. Inspect the uploaded audit artifact. No Release should be created yet."
+            exit 1
+          fi
+
+          echo "=================================================="
+          echo "macOS NOTICE automated audit PASS"
+          echo "Zero unresolved licence findings"
+          echo "Artifact is ready for independent acceptance review"
+          echo "Do NOT create a Release until independent review"
+          echo "=================================================="
