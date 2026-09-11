@@ -514,7 +514,7 @@ jobs:
 
           echo "Exact production embedded UI source-map build PASS"
 
-           - name: Build production-bundle npm licence inventory
+      - name: Build production-bundle npm licence inventory
         shell: bash
         run: |
           set -euo pipefail
@@ -2326,7 +2326,7 @@ jobs:
                           f"Forbidden binary/model in ZIP: {name}"
                       )
 
-                           required = {
+              required = {
                   f"{prefix}LEGAL_SOURCE.txt",
                   f"{prefix}LEGAL_MANIFEST.sha256",
                   f"{prefix}THIRD_PARTY_NOTICES.txt",
@@ -2363,7 +2363,7 @@ jobs:
 
           legal="dist/$FINAL_ROOT/legal"
 
-                    for name in \
+          for name in \
             LEGAL_SOURCE.txt \
             LEGAL_MANIFEST.sha256 \
             THIRD_PARTY_NOTICES.txt \
